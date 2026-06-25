@@ -2,7 +2,9 @@
 
 A **Foundry-native Solidity language server** — the same behavior in every editor, always on your project's exact solc version, with imports resolved exactly like `forge build`.
 
-> Status: pre-implementation. See [DESIGN.md](./DESIGN.md) for the full plan.
+> Status: working. Diagnostics, navigation, completion, and richer editor
+> intelligence (inlay hints, semantic tokens, code actions) all run on your
+> project's exact solc version.
 
 ## Why
 
@@ -17,30 +19,39 @@ This is one shared server that fixes all three: identical everywhere, current so
 ## How it works
 
 - **Diagnostics** come from **solc** (via `foundry-compilers`) → squiggles match `forge build` exactly, on any version.
-- **Code intelligence** (go-to-def, hover, completion) is powered by the **typed solc AST** plus **solar** for fast, error-tolerant live parsing.
+- **As-you-type diagnostics** type-check the unsaved buffer with solc directly (no codegen, no disk writes).
+- **Code intelligence** (go-to-def, hover, completion, inlay hints, semantic tokens, code actions) is powered by the **typed solc AST** from the last successful compile, so it reflects the last good build while you edit.
 - One Rust server; thin clients for VS Code and Zed; a one-line config for Neovim/Helix/Emacs.
 
 ## Install
 
-Build and install the server binary (requires Rust and `forge` on your `PATH`):
+`forge` must be on your `PATH` (the server shells out to it for formatting and
+lint). The server itself auto-downloads the solc version your project pins (via
+svm) on first compile.
 
-```sh
-cargo install --path solidity-lsp --locked
-```
+- **VS Code / Zed:** nothing to build — the extension downloads the prebuilt
+  `solidity-lsp` binary matching its version from the GitHub release on first
+  activation. (If a `solidity-lsp` is already on your `PATH`, Zed uses it.)
+- **Other editors, or to build from source:** install the binary with Rust:
 
-This puts `solidity-lsp` on your `PATH`. (`--locked` uses the pinned
-`Cargo.lock`; required on Rust < 1.95.) It auto-downloads the solc version your
-project pins (via svm) on first compile.
+  ```sh
+  cargo install --path solidity-lsp --locked
+  ```
+
+  This puts `solidity-lsp` on your `PATH`. (`--locked` uses the pinned
+  `Cargo.lock`; required on Rust < 1.95.)
 
 ## Editor setup
 
 Every editor runs the *same* `solidity-lsp` binary, so behavior is identical.
 
 **VS Code** — install the [`solidity-vscode`](./solidity-vscode) extension
-(press F5 from that folder for a dev host). It spawns `solidity-lsp` automatically.
+(press F5 from that folder for a dev host). It downloads and spawns
+`solidity-lsp` automatically; set `solidity.serverPath` to use your own build.
 
 **Zed** — install [`solidity-zed`](./solidity-zed) as a dev extension
-(`zed: install dev extension`).
+(`zed: install dev extension`). It downloads the server binary, or uses one on
+your `PATH`.
 
 **Neovim** (0.11+):
 
@@ -82,9 +93,13 @@ Implemented:
 - **Navigation** — go-to-definition, find references, hover (rendered signatures + NatSpec), document & workspace symbols.
 - **Completion** — type-aware member completion after `.`, plus in-scope symbols — and **signature help**.
 - **Rename** across declarations and references.
+- **Inlay hints** — call-site parameter names (functions, events, errors, struct constructors).
+- **Semantic tokens** — identifiers colored by what they resolve to, declarations and references alike.
+- **Code actions** — `forge lint` fixes, add a missing SPDX identifier or pragma, and import an undeclared symbol from where it's defined.
 - **`forge lint`** warnings surfaced inline.
+- **Monorepos** — several `foundry.toml` roots open at once each keep their own index.
 
-Planned: inlay hints, code actions, semantic tokens, packaged per-editor releases.
+Planned: solar-based live parsing so completion/outline stay sharp mid-edit (today intelligence reflects the last successful compile); published Marketplace / Open VSX / Zed registry listings.
 
 ## License
 
