@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Foundry-native Solidity language server"
-repository = "https://github.com/foundry-rs/solidity"
+repository = "https://github.com/u-zzam/solidity"
 
 [dependencies]
 foundry-compilers = { version = "0.19.14", features = ["svm-solc"] }

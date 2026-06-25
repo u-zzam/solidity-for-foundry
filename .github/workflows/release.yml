@@ -1,0 +1,62 @@
+name: release
+
+# Build the language server for every supported platform from a single tag and
+# attach the binaries to a GitHub release. The editor clients download the asset
+# matching their platform on activation, so a tag is the only publish step for
+# the server itself.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create the release (idempotent)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" \
+            || gh release create "${{ github.ref_name }}" --repo "${{ github.repository }}" \
+                 --title "${{ github.ref_name }}" --generate-notes
+
+  build:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked -p solidity-lsp --target ${{ matrix.target }}
+      - name: Package and upload (unix)
+        if: runner.os != 'Windows'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset="solidity-lsp-${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release/solidity-lsp" "$asset"
+          gh release upload "${{ github.ref_name }}" "$asset" --repo "${{ github.repository }}" --clobber
+      - name: Package and upload (windows)
+        if: runner.os == 'Windows'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $asset = "solidity-lsp-${{ matrix.target }}.exe"
+          Copy-Item "target/${{ matrix.target }}/release/solidity-lsp.exe" $asset
+          gh release upload "${{ github.ref_name }}" $asset --repo "${{ github.repository }}" --clobber
