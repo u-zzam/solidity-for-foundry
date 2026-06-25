@@ -8,13 +8,14 @@
 //! with a `nameLocation` is a declaration; any node with a
 //! `referencedDeclaration` is a reference.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 use tower_lsp::lsp_types::{
-    DocumentSymbol, Location, Position, Range, SymbolInformation, SymbolKind, TextEdit, Url,
-    WorkspaceEdit,
+    CompletionItem, CompletionItemKind, Documentation, DocumentSymbol, Location, ParameterInformation,
+    ParameterLabel, Position, Range, SignatureHelp, SignatureInformation, SymbolInformation,
+    SymbolKind, TextEdit, Url, WorkspaceEdit,
 };
 
 use crate::diagnostics::PositionMapper;
@@ -30,7 +31,16 @@ struct Decl {
     type_string: Option<String>,
     /// Pre-rendered signature for callables (functions/events/errors/modifiers).
     signature: Option<String>,
+    /// Parameter labels (`type name`) for callables, for signature help.
+    params: Vec<String>,
     doc: Option<String>,
+}
+
+/// A member of a contract / library / struct / enum, for `.` completion.
+struct Member {
+    name: String,
+    kind: String,
+    detail: String,
 }
 
 impl Decl {
@@ -80,6 +90,10 @@ pub struct Index {
     path_to_index: HashMap<PathBuf, usize>,
     decls: HashMap<i64, Decl>,
     refs_by_decl: HashMap<i64, Vec<RefSpan>>,
+    /// Container name (contract/library/struct/enum) -> its members.
+    containers: HashMap<String, Vec<Member>>,
+    /// Callable name -> declaration ids, for signature help (overloads included).
+    callables: HashMap<String, Vec<i64>>,
 }
 
 impl Index {
@@ -88,6 +102,8 @@ impl Index {
         let mut path_to_index = HashMap::new();
         let mut decls: HashMap<i64, Decl> = HashMap::new();
         let mut refs_by_decl: HashMap<i64, Vec<RefSpan>> = HashMap::new();
+        let mut containers: HashMap<String, Vec<Member>> = HashMap::new();
+        let mut callables: HashMap<String, Vec<i64>> = HashMap::new();
 
         for s in sources {
             let Ok(text) = std::fs::read_to_string(&s.path) else {
@@ -112,14 +128,25 @@ impl Index {
                 ) {
                     if !name.is_empty() {
                         spans.push(Span { start, end: start + len, decl: id });
+                        let kind = gets(map, "nodeType").unwrap_or_default();
+                        if matches!(
+                            kind,
+                            "FunctionDefinition"
+                                | "EventDefinition"
+                                | "ErrorDefinition"
+                                | "ModifierDefinition"
+                        ) {
+                            callables.entry(name.to_string()).or_default().push(id);
+                        }
                         decls.entry(id).or_insert_with(|| Decl {
                             src_index: s.index,
                             name_start: start,
                             name_end: start + len,
                             name: name.to_string(),
-                            kind: gets(map, "nodeType").unwrap_or_default().to_string(),
+                            kind: kind.to_string(),
                             type_string: type_string(map),
                             signature: signature(map),
+                            params: param_list(map, "parameters"),
                             doc: documentation(map),
                         });
                         return;
@@ -145,10 +172,11 @@ impl Index {
                 }
             });
 
+            collect_containers(&s.ast, &mut containers);
             files.insert(s.index, FileEntry { uri, text, spans, symbols });
         }
 
-        Self { files, path_to_index, decls, refs_by_decl }
+        Self { files, path_to_index, decls, refs_by_decl, containers, callables }
     }
 
     pub fn definition(&self, path: &Path, pos: Position) -> Option<Location> {
@@ -240,6 +268,67 @@ impl Index {
             }
         }
         out
+    }
+
+    /// Members of a named container (`Lib.` / `Contract.` / struct / enum).
+    pub fn member_completions(&self, container: &str) -> Vec<CompletionItem> {
+        self.containers
+            .get(container)
+            .map(|members| {
+                members
+                    .iter()
+                    .map(|m| CompletionItem {
+                        label: m.name.clone(),
+                        kind: Some(completion_kind(&m.kind)),
+                        detail: (!m.detail.is_empty()).then(|| m.detail.clone()),
+                        ..Default::default()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Every declared symbol name (deduped) for in-scope-ish completion.
+    pub fn global_completions(&self) -> Vec<CompletionItem> {
+        let mut seen = HashSet::new();
+        self.decls
+            .values()
+            .filter(|d| seen.insert(d.name.as_str()))
+            .map(|d| CompletionItem {
+                label: d.name.clone(),
+                kind: Some(completion_kind(&d.kind)),
+                detail: d.signature.clone().or_else(|| d.type_string.clone()),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    /// Signature help for a callable by name (all overloads).
+    pub fn signatures(&self, callee: &str, active: u32) -> Option<SignatureHelp> {
+        let ids = self.callables.get(callee)?;
+        let signatures: Vec<SignatureInformation> = ids
+            .iter()
+            .filter_map(|id| self.decls.get(id))
+            .map(|d| SignatureInformation {
+                label: d.signature.clone().unwrap_or_else(|| d.name.clone()),
+                documentation: d.doc.clone().map(Documentation::String),
+                parameters: Some(
+                    d.params
+                        .iter()
+                        .map(|p| ParameterInformation {
+                            label: ParameterLabel::Simple(p.clone()),
+                            documentation: None,
+                        })
+                        .collect(),
+                ),
+                active_parameter: Some(active),
+            })
+            .collect();
+        (!signatures.is_empty()).then(|| SignatureHelp {
+            signatures,
+            active_signature: Some(0),
+            active_parameter: Some(active),
+        })
     }
 
     fn slot_for(&self, path: &Path) -> Option<usize> {
@@ -395,9 +484,14 @@ fn signature(map: &Map<String, Value>) -> Option<String> {
 
 /// Render a `ParameterList` field as `type name, type name`.
 fn params(map: &Map<String, Value>, key: &str) -> String {
+    param_list(map, key).join(", ")
+}
+
+/// Each parameter of a `ParameterList` field as a `type name` label.
+fn param_list(map: &Map<String, Value>, key: &str) -> Vec<String> {
     let Some(list) = map.get(key).and_then(|p| p.get("parameters")).and_then(|a| a.as_array())
     else {
-        return String::new();
+        return Vec::new();
     };
     list.iter()
         .map(|p| {
@@ -411,8 +505,62 @@ fn params(map: &Map<String, Value>, key: &str) -> String {
                 None => ty.to_string(),
             }
         })
-        .collect::<Vec<_>>()
-        .join(", ")
+        .collect()
+}
+
+/// Record the members of each container (contract/library/struct/enum) by name.
+fn collect_containers(ast: &Value, containers: &mut HashMap<String, Vec<Member>>) {
+    let Some(nodes) = ast.get("nodes").and_then(|n| n.as_array()) else {
+        return;
+    };
+    for node in nodes {
+        let Some(map) = node.as_object() else {
+            continue;
+        };
+        let kind = gets(map, "nodeType").unwrap_or_default();
+        if !matches!(
+            kind,
+            "ContractDefinition" | "StructDefinition" | "EnumDefinition"
+        ) {
+            continue;
+        }
+        let Some(name) = gets(map, "name").filter(|n| !n.is_empty()) else {
+            continue;
+        };
+        // Contracts keep members in `nodes`; structs/enums in `members`.
+        let children = node
+            .get("nodes")
+            .and_then(|n| n.as_array())
+            .or_else(|| node.get("members").and_then(|n| n.as_array()));
+        let members: Vec<Member> = children
+            .map(|arr| arr.iter().filter_map(member_of).collect())
+            .unwrap_or_default();
+        containers.entry(name.to_string()).or_default().extend(members);
+    }
+}
+
+fn member_of(node: &Value) -> Option<Member> {
+    let map = node.as_object()?;
+    let name = gets(map, "name").filter(|n| !n.is_empty())?;
+    let kind = gets(map, "nodeType")?;
+    let detail = signature(map).or_else(|| type_string(map)).unwrap_or_default();
+    Some(Member { name: name.to_string(), kind: kind.to_string(), detail })
+}
+
+fn completion_kind(node_type: &str) -> CompletionItemKind {
+    match node_type {
+        "ContractDefinition" => CompletionItemKind::CLASS,
+        "FunctionDefinition" => CompletionItemKind::FUNCTION,
+        "ModifierDefinition" => CompletionItemKind::FUNCTION,
+        "VariableDeclaration" => CompletionItemKind::FIELD,
+        "EventDefinition" => CompletionItemKind::EVENT,
+        "ErrorDefinition" => CompletionItemKind::CONSTRUCTOR,
+        "StructDefinition" => CompletionItemKind::STRUCT,
+        "EnumDefinition" => CompletionItemKind::ENUM,
+        "EnumValue" => CompletionItemKind::ENUM_MEMBER,
+        "UserDefinedValueTypeDefinition" => CompletionItemKind::STRUCT,
+        _ => CompletionItemKind::VARIABLE,
+    }
 }
 
 fn gets<'a>(map: &'a Map<String, Value>, key: &str) -> Option<&'a str> {

@@ -180,6 +180,14 @@ impl LanguageServer for Backend {
                 document_symbol_provider: Some(OneOf::Left(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
                 rename_provider: Some(OneOf::Left(true)),
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec![".".to_string()]),
+                    ..Default::default()
+                }),
+                signature_help_provider: Some(SignatureHelpOptions {
+                    trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         })
@@ -269,6 +277,39 @@ impl LanguageServer for Backend {
         Ok(Some(idx.workspace_symbols(&params.query)))
     }
 
+    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        let p = params.text_document_position;
+        let Some(text) = self.state.docs.read().await.get(&p.text_document.uri).cloned() else {
+            return Ok(None);
+        };
+        let offset = diagnostics::PositionMapper::new(&text).offset(p.position);
+        let guard = self.state.index.read().await;
+        let Some(idx) = guard.as_ref() else {
+            return Ok(None);
+        };
+        let items = match member_context(&text, offset) {
+            Some(container) => idx.member_completions(&container),
+            None => idx.global_completions(),
+        };
+        Ok((!items.is_empty()).then(|| CompletionResponse::Array(items)))
+    }
+
+    async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
+        let p = params.text_document_position_params;
+        let Some(text) = self.state.docs.read().await.get(&p.text_document.uri).cloned() else {
+            return Ok(None);
+        };
+        let offset = diagnostics::PositionMapper::new(&text).offset(p.position);
+        let Some((callee, active)) = call_context(&text, offset) else {
+            return Ok(None);
+        };
+        let guard = self.state.index.read().await;
+        let Some(idx) = guard.as_ref() else {
+            return Ok(None);
+        };
+        Ok(idx.signatures(&callee, active))
+    }
+
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
         let p = params.text_document_position;
         let Ok(path) = p.text_document.uri.to_file_path() else {
@@ -329,6 +370,84 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         self.state.docs.write().await.remove(&params.text_document.uri);
+    }
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+/// If the cursor is completing `<ident>.<partial>`, return `<ident>`.
+fn member_context(text: &str, offset: usize) -> Option<String> {
+    let b = text.as_bytes();
+    let mut i = offset.min(b.len());
+    while i > 0 && is_ident_byte(b[i - 1]) {
+        i -= 1; // skip the partial member being typed
+    }
+    if i == 0 || b[i - 1] != b'.' {
+        return None;
+    }
+    let mut k = i - 1; // at the '.'
+    while k > 0 && b[k - 1].is_ascii_whitespace() {
+        k -= 1;
+    }
+    let end = k;
+    while k > 0 && is_ident_byte(b[k - 1]) {
+        k -= 1;
+    }
+    (k < end).then(|| text[k..end].to_string())
+}
+
+/// Find the enclosing call for signature help: `(callee_name, active_param)`.
+/// A backward paren scan; it does not skip strings/comments (good enough live).
+fn call_context(text: &str, offset: usize) -> Option<(String, u32)> {
+    let b = text.as_bytes();
+    let mut i = offset.min(b.len());
+    let mut depth = 0i32;
+    let mut commas = 0u32;
+    while i > 0 {
+        i -= 1;
+        match b[i] {
+            b')' => depth += 1,
+            b'(' if depth > 0 => depth -= 1,
+            b'(' => {
+                let mut k = i;
+                while k > 0 && b[k - 1].is_ascii_whitespace() {
+                    k -= 1;
+                }
+                let end = k;
+                while k > 0 && is_ident_byte(b[k - 1]) {
+                    k -= 1;
+                }
+                return (k < end).then(|| (text[k..end].to_string(), commas));
+            }
+            b',' if depth == 0 => commas += 1,
+            b';' | b'{' | b'}' if depth == 0 => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{call_context, member_context};
+
+    #[test]
+    fn member_contexts() {
+        assert_eq!(member_context("MathLib.mi", 10), Some("MathLib".into()));
+        assert_eq!(member_context("MathLib.", 8), Some("MathLib".into()));
+        assert_eq!(member_context("foo bar", 7), None);
+    }
+
+    #[test]
+    fn call_contexts() {
+        assert_eq!(call_context("min(a, b", 8), Some(("min".into(), 1)));
+        assert_eq!(call_context("min(", 4), Some(("min".into(), 0)));
+        // nested call resolves to the inner callee and its active param
+        assert_eq!(call_context("min(a, max(b,", 13), Some(("max".into(), 1)));
+        // a statement boundary means we are not inside a call
+        assert_eq!(call_context("x = 1; y", 8), None);
     }
 }
 
