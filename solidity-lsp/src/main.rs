@@ -175,6 +175,14 @@ impl Backend {
         tokio::spawn(async move { me.build_index(uri).await });
     }
 
+    /// Type-check the buffer immediately (no debounce) — used on open so the
+    /// first diagnostics appear in well under a second instead of waiting for
+    /// the full codegen compile.
+    fn schedule_live_check_now(&self, uri: Url) {
+        let me = self.clone();
+        tokio::spawn(async move { me.live_check(uri).await });
+    }
+
     /// Debounce, then type-check the live buffer for fast as-you-type feedback.
     fn schedule_live_check(&self, uri: Url, version: i32) {
         let me = self.clone();
@@ -448,6 +456,9 @@ impl LanguageServer for Backend {
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let doc = params.text_document;
         self.state.docs.write().await.insert(doc.uri.clone(), doc.text);
+        // Fast type-check first (instant feedback), then the full codegen
+        // compile + navigation index in the background.
+        self.schedule_live_check_now(doc.uri.clone());
         self.schedule_diagnostics(doc.uri.clone());
         self.schedule_index(doc.uri);
     }
