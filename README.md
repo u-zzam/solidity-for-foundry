@@ -71,12 +71,19 @@ language-servers = ["solidity-lsp"]
   (add-to-list 'eglot-server-programs '(solidity-mode . ("solidity-lsp"))))
 ```
 
-## Roadmap
+## Features
 
-- **P1** diagnostics + formatting (alpha)
-- **P2** navigation: go-to-def, references, hover, symbols (beta)
-- **P3** completion, signature help, rename, as-you-type (1.0 — parity)
-- **P4** lint, inlay hints, code actions (1.x — surpass)
+Implemented:
+
+- **Diagnostics** byte-identical to `forge build` — any solc version (auto-installed), correct imports/remappings, the same warning suppression (`ignored_error_codes`, `ignored_warnings_from`).
+- **As-you-type diagnostics** — the unsaved buffer is type-checked live (no codegen, no disk writes).
+- **Formatting** via `forge fmt`.
+- **Navigation** — go-to-definition, find references, hover (rendered signatures + NatSpec), document & workspace symbols.
+- **Completion** — type-aware member completion after `.`, plus in-scope symbols — and **signature help**.
+- **Rename** across declarations and references.
+- **`forge lint`** warnings surfaced inline.
+
+Planned: inlay hints, code actions, semantic tokens, packaged per-editor releases.
 
 ## License
 
