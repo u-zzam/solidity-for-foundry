@@ -324,7 +324,7 @@ impl Index {
                 active_parameter: Some(active),
             })
             .collect();
-        (!signatures.is_empty()).then(|| SignatureHelp {
+        (!signatures.is_empty()).then_some(SignatureHelp {
             signatures,
             active_signature: Some(0),
             active_parameter: Some(active),

@@ -355,7 +355,7 @@ impl LanguageServer for Backend {
             Some(container) => idx.member_completions(&container),
             None => idx.global_completions(),
         };
-        Ok((!items.is_empty()).then(|| CompletionResponse::Array(items)))
+        Ok((!items.is_empty()).then_some(CompletionResponse::Array(items)))
     }
 
     async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {

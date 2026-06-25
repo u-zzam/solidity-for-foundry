@@ -335,13 +335,16 @@ fn build_paths(root: &Path, cfg: &Config) -> Result<ProjectPathsConfig<SolcLangu
 }
 
 fn build_settings(cfg: &Config) -> Settings {
-    let mut settings = Settings::default();
-    settings.optimizer = Optimizer {
-        enabled: cfg.optimizer,
-        runs: cfg.optimizer_runs,
-        details: None,
+    let mut settings = Settings {
+        optimizer: Optimizer {
+            enabled: cfg.optimizer,
+            runs: cfg.optimizer_runs,
+            details: None,
+        },
+        via_ir: cfg.via_ir,
+        ..Default::default()
     };
-    settings.via_ir = cfg.via_ir;
+    // Only override the version-appropriate default when explicitly configured.
     if let Some(evm) = cfg.evm_version {
         settings.evm_version = Some(evm);
     }
