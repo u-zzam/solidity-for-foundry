@@ -771,6 +771,17 @@ fn call_context(text: &str, offset: usize) -> Option<(String, u32)> {
     None
 }
 
+#[tokio::main]
+async fn main() {
+    let (service, socket) = LspService::new(|client| Backend {
+        client,
+        state: Arc::new(State::default()),
+    });
+    Server::new(tokio::io::stdin(), tokio::io::stdout(), socket)
+        .serve(service)
+        .await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::{call_context, import_line, member_context, pragma_from_message, relative_import};
@@ -818,15 +829,4 @@ mod tests {
         // a statement boundary means we are not inside a call
         assert_eq!(call_context("x = 1; y", 8), None);
     }
-}
-
-#[tokio::main]
-async fn main() {
-    let (service, socket) = LspService::new(|client| Backend {
-        client,
-        state: Arc::new(State::default()),
-    });
-    Server::new(tokio::io::stdin(), tokio::io::stdout(), socket)
-        .serve(service)
-        .await;
 }
