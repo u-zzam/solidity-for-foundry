@@ -33,27 +33,35 @@ function targetTriple(): string | undefined {
 function download(url: string, dest: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(dest);
-    const get = (u: string) =>
+    const fail = (e: Error) => {
+      file.destroy();
+      fs.rm(dest, () => reject(e));
+    };
+    file.on("error", fail); // disk write failure (full disk, permissions)
+    const get = (u: string, redirects: number) => {
+      if (redirects > 5) {
+        fail(new Error("too many redirects"));
+        return;
+      }
       https
         .get(u, { headers: { "User-Agent": "solidity-vscode" } }, (res) => {
           const status = res.statusCode ?? 0;
           if (status >= 300 && status < 400 && res.headers.location) {
             res.resume();
-            get(res.headers.location);
+            get(res.headers.location, redirects + 1);
             return;
           }
           if (status !== 200) {
             res.resume();
-            reject(new Error(`HTTP ${status}`));
+            fail(new Error(`HTTP ${status}`));
             return;
           }
           res.pipe(file);
           file.on("finish", () => file.close(() => resolve()));
         })
-        .on("error", (e) => {
-          fs.rm(dest, () => reject(e));
-        });
-    get(url);
+        .on("error", fail);
+    };
+    get(url, 0);
   });
 }
 
