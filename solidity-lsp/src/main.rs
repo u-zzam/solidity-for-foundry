@@ -252,16 +252,15 @@ impl Backend {
             return;
         };
 
-        let (r, t) = (root.clone(), path.clone());
+        let (r, t, buf) = (root.clone(), path.clone(), buffer.clone());
         let Ok(Ok(errors)) =
-            tokio::task::spawn_blocking(move || project::check_buffer(&r, &t, &buffer)).await
+            tokio::task::spawn_blocking(move || project::check_buffer(&r, &t, &buf)).await
         else {
             return;
         };
 
-        let diags = diagnostics::group(&errors, &root, &uri)
-            .remove(&uri)
-            .unwrap_or_default();
+        // Map positions against the buffer solc actually compiled, not disk.
+        let diags = diagnostics::for_buffer(&errors, &root, &uri, &buffer);
         let mut published = self.state.published.lock().await;
         if diags.is_empty() {
             published.remove(&uri);

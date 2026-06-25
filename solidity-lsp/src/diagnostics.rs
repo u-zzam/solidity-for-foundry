@@ -141,6 +141,25 @@ pub fn group(errors: &[SolcError], root: &Path, fallback: &Url) -> HashMap<Url, 
     out
 }
 
+/// Diagnostics for the single edited file, mapped against the in-memory
+/// `buffer` rather than disk. Live checks compile the unsaved buffer, so solc's
+/// byte offsets only line up with the buffer — using the on-disk text would
+/// misplace every squiggle once the buffer and file diverge. Only errors
+/// located in `target` are returned (that's all a live check publishes).
+pub fn for_buffer(errors: &[SolcError], root: &Path, target: &Url, buffer: &str) -> Vec<Diagnostic> {
+    let mapper = PositionMapper::new(buffer);
+    errors
+        .iter()
+        .filter(|err| {
+            err.source_location
+                .as_ref()
+                .and_then(|loc| Url::from_file_path(root.join(&loc.file)).ok())
+                .is_some_and(|uri| uri == *target)
+        })
+        .map(|err| to_diagnostic(err, &mapper))
+        .collect()
+}
+
 /// Group `forge lint` findings by file URI into LSP diagnostics, tagged with
 /// source `forge lint`. The caller merges these into the same per-file publish
 /// as the solc diagnostics so both kinds of squiggle coexist.
