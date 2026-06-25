@@ -300,6 +300,7 @@ impl LanguageServer for Backend {
                     ..Default::default()
                 }),
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+                inlay_hint_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
         })
@@ -456,6 +457,18 @@ impl LanguageServer for Backend {
             })
             .collect();
         Ok((!actions.is_empty()).then_some(actions))
+    }
+
+    async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        let Ok(path) = params.text_document.uri.to_file_path() else {
+            return Ok(None);
+        };
+        let guard = self.state.index.read().await;
+        let Some(idx) = guard.as_ref() else {
+            return Ok(None);
+        };
+        let hints = idx.inlay_hints(&path, params.range);
+        Ok((!hints.is_empty()).then_some(hints))
     }
 
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {

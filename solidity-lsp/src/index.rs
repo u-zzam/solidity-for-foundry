@@ -13,9 +13,9 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 use tower_lsp::lsp_types::{
-    CompletionItem, CompletionItemKind, Documentation, DocumentSymbol, Location, ParameterInformation,
-    ParameterLabel, Position, Range, SignatureHelp, SignatureInformation, SymbolInformation,
-    SymbolKind, TextEdit, Url, WorkspaceEdit,
+    CompletionItem, CompletionItemKind, Documentation, DocumentSymbol, InlayHint, InlayHintKind,
+    InlayHintLabel, Location, ParameterInformation, ParameterLabel, Position, Range, SignatureHelp,
+    SignatureInformation, SymbolInformation, SymbolKind, TextEdit, Url, WorkspaceEdit,
 };
 
 use crate::diagnostics::PositionMapper;
@@ -33,6 +33,9 @@ struct Decl {
     signature: Option<String>,
     /// Parameter labels (`type name`) for callables, for signature help.
     params: Vec<String>,
+    /// Parameter names only (callables' params or a struct's fields, in order),
+    /// for call-site inlay hints. Empty string for an unnamed parameter.
+    param_names: Vec<String>,
     doc: Option<String>,
 }
 
@@ -77,12 +80,27 @@ struct FileEntry {
     /// Clickable spans (references + declaration names) mapping to a declaration.
     spans: Vec<Span>,
     symbols: Vec<DocumentSymbol>,
+    /// Pre-resolved call-site parameter-name inlay hints (position + label).
+    hints: Vec<(Position, String)>,
 }
 
 struct Span {
     start: usize,
     end: usize,
     decl: i64,
+}
+
+/// A call argument awaiting its callee's parameter name (resolved after the
+/// whole project is indexed, since the callee may be declared elsewhere).
+struct PendingHint {
+    src_index: usize,
+    byte: usize,
+    /// The callee declaration the call resolved to.
+    callee: i64,
+    arg_index: usize,
+    /// If the argument is a bare identifier, its name — used to drop hints that
+    /// would just echo the argument (`transfer(to, amount)`).
+    arg_ident: Option<String>,
 }
 
 pub struct Index {
@@ -104,6 +122,7 @@ impl Index {
         let mut refs_by_decl: HashMap<i64, Vec<RefSpan>> = HashMap::new();
         let mut containers: HashMap<String, Vec<Member>> = HashMap::new();
         let mut callables: HashMap<String, Vec<i64>> = HashMap::new();
+        let mut pending: Vec<PendingHint> = Vec::new();
 
         for s in sources {
             let Ok(text) = std::fs::read_to_string(&s.path) else {
@@ -147,10 +166,15 @@ impl Index {
                             type_string: type_string(map),
                             signature: signature(map),
                             params: param_list(map, "parameters"),
+                            param_names: decl_param_names(map),
                             doc: documentation(map),
                         });
                         return;
                     }
+                }
+                // Call site: queue a parameter-name hint per positional argument.
+                if gets(map, "nodeType") == Some("FunctionCall") {
+                    collect_call_hints(map, s.index, &mut pending);
                 }
                 // Reference: points at a declaration.
                 if let Some(refid) = geti(map, "referencedDeclaration") {
@@ -173,10 +197,47 @@ impl Index {
             });
 
             collect_containers(&s.ast, &mut containers);
-            files.insert(s.index, FileEntry { uri, text, spans, symbols });
+            files.insert(s.index, FileEntry { uri, text, spans, symbols, hints: Vec::new() });
+        }
+
+        // Resolve queued call-site hints now that every declaration is known
+        // (a call's callee may be declared in any indexed file).
+        for h in pending {
+            let Some(decl) = decls.get(&h.callee) else {
+                continue;
+            };
+            let Some(label) = param_hint(&decl.param_names, h.arg_index, h.arg_ident.as_deref())
+            else {
+                continue;
+            };
+            if let Some(f) = files.get_mut(&h.src_index) {
+                let pos = PositionMapper::new(&f.text).position(h.byte);
+                f.hints.push((pos, label));
+            }
         }
 
         Self { files, path_to_index, decls, refs_by_decl, containers, callables }
+    }
+
+    /// Call-site parameter-name inlay hints within `range`.
+    pub fn inlay_hints(&self, path: &Path, range: Range) -> Vec<InlayHint> {
+        let Some(f) = self.slot_for(path).and_then(|i| self.files.get(&i)) else {
+            return Vec::new();
+        };
+        f.hints
+            .iter()
+            .filter(|(pos, _)| range.start <= *pos && *pos <= range.end)
+            .map(|(pos, label)| InlayHint {
+                position: *pos,
+                label: InlayHintLabel::String(label.clone()),
+                kind: Some(InlayHintKind::PARAMETER),
+                text_edits: None,
+                tooltip: None,
+                padding_left: Some(false),
+                padding_right: Some(true),
+                data: None,
+            })
+            .collect()
     }
 
     pub fn definition(&self, path: &Path, pos: Position) -> Option<Location> {
@@ -508,6 +569,70 @@ fn param_list(map: &Map<String, Value>, key: &str) -> Vec<String> {
         .collect()
 }
 
+/// Ordered parameter names for a callable (its `parameters`) or a struct (its
+/// `members`), so a call site can label each positional argument. Unnamed
+/// parameters yield an empty string.
+fn decl_param_names(map: &Map<String, Value>) -> Vec<String> {
+    let arr = match gets(map, "nodeType") {
+        Some("StructDefinition") => map.get("members").and_then(|m| m.as_array()),
+        _ => map
+            .get("parameters")
+            .and_then(|p| p.get("parameters"))
+            .and_then(|a| a.as_array()),
+    };
+    arr.map(|list| {
+        list.iter()
+            .map(|p| p.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string())
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Queue a parameter-name hint for each positional argument of a call. Skips
+/// named-argument calls (`f({a: 1})`) and type conversions (`uint8(x)`), which
+/// carry no parameter names worth surfacing.
+fn collect_call_hints(map: &Map<String, Value>, src_index: usize, out: &mut Vec<PendingHint>) {
+    match gets(map, "kind") {
+        Some("functionCall") | Some("structConstructorCall") => {}
+        _ => return,
+    }
+    // Named arguments already show their names in source.
+    if map.get("names").and_then(|n| n.as_array()).is_some_and(|a| !a.is_empty()) {
+        return;
+    }
+    let Some(callee) = map
+        .get("expression")
+        .and_then(|e| e.as_object())
+        .and_then(|e| geti(e, "referencedDeclaration"))
+        .filter(|id| *id >= 0)
+    else {
+        return;
+    };
+    let Some(args) = map.get("arguments").and_then(|a| a.as_array()) else {
+        return;
+    };
+    for (i, arg) in args.iter().enumerate() {
+        let Some((byte, _)) = arg.get("src").and_then(|s| s.as_str()).and_then(parse_src) else {
+            continue;
+        };
+        let arg_ident = (arg.get("nodeType").and_then(|t| t.as_str()) == Some("Identifier"))
+            .then(|| arg.get("name").and_then(|v| v.as_str()).map(String::from))
+            .flatten();
+        out.push(PendingHint { src_index, byte, callee, arg_index: i, arg_ident });
+    }
+}
+
+/// The inlay label for one argument, or `None` if no hint should show: the
+/// callee has no name for that position, the parameter is unnamed, or the
+/// argument is just the parameter's name spelled out.
+fn param_hint(param_names: &[String], arg_index: usize, arg_ident: Option<&str>) -> Option<String> {
+    let name = param_names.get(arg_index).filter(|n| !n.is_empty())?;
+    if arg_ident == Some(name.as_str()) {
+        return None;
+    }
+    Some(format!("{name}:"))
+}
+
 /// Record the members of each container (contract/library/struct/enum) by name.
 fn collect_containers(ast: &Value, containers: &mut HashMap<String, Vec<Member>>) {
     let Some(nodes) = ast.get("nodes").and_then(|n| n.as_array()) else {
@@ -605,5 +730,18 @@ mod tests {
         assert_eq!(parse_src("12:5:0"), Some((12, 5)));
         assert_eq!(parse_src("12:-1:-1"), None);
         assert_eq!(parse_src("bad"), None);
+    }
+
+    #[test]
+    fn param_hints_label_only_when_useful() {
+        let names = vec!["to".to_string(), "amount".to_string(), String::new()];
+        // A literal/expression argument gets the parameter name.
+        assert_eq!(param_hint(&names, 0, None), Some("to:".into()));
+        assert_eq!(param_hint(&names, 1, Some("value")), Some("amount:".into()));
+        // An argument that already spells the parameter is not re-labeled.
+        assert_eq!(param_hint(&names, 0, Some("to")), None);
+        // Unnamed parameter and out-of-range index produce nothing.
+        assert_eq!(param_hint(&names, 2, None), None);
+        assert_eq!(param_hint(&names, 9, None), None);
     }
 }
