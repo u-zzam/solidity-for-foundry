@@ -67,7 +67,17 @@ impl Backend {
             }
         };
 
-        let new = diagnostics::group(&errors, &root, &trigger);
+        let mut new = diagnostics::group(&errors, &root, &trigger);
+
+        // Surface `forge lint` (solar) findings alongside solc diagnostics.
+        let r2 = root.clone();
+        let lints = tokio::task::spawn_blocking(move || project::lint(&r2))
+            .await
+            .unwrap_or_default();
+        for (uri, mut ds) in diagnostics::group_lints(&lints) {
+            new.entry(uri).or_default().append(&mut ds);
+        }
+
         let total: usize = new.values().map(Vec::len).sum();
         self.client
             .log_message(

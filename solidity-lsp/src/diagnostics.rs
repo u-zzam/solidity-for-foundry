@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use foundry_compilers::artifacts::{Error as SolcError, Severity};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range, Url};
 
+use crate::project::LintFinding;
+
 /// Converts byte offsets within a single source file into LSP positions.
 pub struct PositionMapper<'a> {
     text: &'a str,
@@ -135,6 +137,45 @@ pub fn group(errors: &[SolcError], root: &Path, fallback: &Url) -> HashMap<Url, 
             .unwrap_or("");
         let mapper = PositionMapper::new(text);
         out.entry(uri).or_default().push(to_diagnostic(err, &mapper));
+    }
+    out
+}
+
+/// Group `forge lint` findings by file URI into LSP diagnostics, tagged with
+/// source `forge lint`. The caller merges these into the same per-file publish
+/// as the solc diagnostics so both kinds of squiggle coexist.
+pub fn group_lints(findings: &[LintFinding]) -> HashMap<Url, Vec<Diagnostic>> {
+    let mut texts: HashMap<PathBuf, Option<String>> = HashMap::new();
+    for f in findings {
+        texts
+            .entry(f.file.clone())
+            .or_insert_with(|| std::fs::read_to_string(&f.file).ok());
+    }
+
+    let mut out: HashMap<Url, Vec<Diagnostic>> = HashMap::new();
+    for f in findings {
+        let Ok(uri) = Url::from_file_path(&f.file) else {
+            continue;
+        };
+        let text = texts.get(&f.file).and_then(|o| o.as_deref()).unwrap_or("");
+        let mapper = PositionMapper::new(text);
+        let severity = match f.level.as_str() {
+            "error" => DiagnosticSeverity::ERROR,
+            "warning" => DiagnosticSeverity::WARNING,
+            "help" => DiagnosticSeverity::HINT,
+            _ => DiagnosticSeverity::INFORMATION,
+        };
+        out.entry(uri).or_default().push(Diagnostic {
+            range: Range::new(
+                mapper.position(f.byte_start),
+                mapper.position(f.byte_end.max(f.byte_start)),
+            ),
+            severity: Some(severity),
+            code: f.code.clone().map(NumberOrString::String),
+            source: Some("forge lint".to_string()),
+            message: f.message.clone(),
+            ..Default::default()
+        });
     }
     out
 }

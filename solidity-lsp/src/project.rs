@@ -47,6 +47,78 @@ fn error_code(s: &str) -> Option<u64> {
     }
 }
 
+/// One `forge lint` finding (a solar lint), located by byte offsets.
+pub struct LintFinding {
+    pub file: PathBuf,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub level: String,
+    pub code: Option<String>,
+    pub message: String,
+}
+
+/// Run `forge lint --json` and parse its rustc-style NDJSON diagnostics. forge
+/// applies the project's `[lint]` config (ignored paths, excluded lints), so the
+/// findings match `forge lint` exactly. Returns empty if forge is unavailable.
+pub fn lint(root: &Path) -> Vec<LintFinding> {
+    let Ok(out) = Command::new("forge")
+        .arg("lint")
+        .arg("--json")
+        .arg("--root")
+        .arg(root)
+        .output()
+    else {
+        return Vec::new();
+    };
+    // Diagnostics may land on either stream depending on forge version.
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push('\n');
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+
+    let mut findings = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("$message_type").and_then(|m| m.as_str()) != Some("diagnostic") {
+            continue;
+        }
+        let spans = v.get("spans").and_then(|s| s.as_array());
+        let span = spans.and_then(|arr| {
+            arr.iter()
+                .find(|sp| sp.get("is_primary").and_then(|p| p.as_bool()).unwrap_or(false))
+                .or_else(|| arr.first())
+        });
+        let Some(span) = span else {
+            continue;
+        };
+        let (Some(file), Some(bs), Some(be)) = (
+            span.get("file_name").and_then(|f| f.as_str()),
+            span.get("byte_start").and_then(|b| b.as_u64()),
+            span.get("byte_end").and_then(|b| b.as_u64()),
+        ) else {
+            continue;
+        };
+        findings.push(LintFinding {
+            file: PathBuf::from(file),
+            byte_start: bs as usize,
+            byte_end: be as usize,
+            level: v.get("level").and_then(|l| l.as_str()).unwrap_or("note").to_string(),
+            code: v
+                .get("code")
+                .and_then(|c| c.get("code"))
+                .and_then(|c| c.as_str())
+                .map(String::from),
+            message: v.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string(),
+        });
+    }
+    findings
+}
+
 /// Format `src` with `forge fmt`, honoring the project's `[fmt]` config (via
 /// `--root`). Returns `None` if forge is unavailable or the input doesn't parse.
 pub fn format(root: Option<&Path>, src: &str) -> Option<String> {
