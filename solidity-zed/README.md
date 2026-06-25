@@ -8,7 +8,7 @@ language and runs the shared server, so behavior matches every other editor.
 The `solidity-lsp` binary on your `PATH`:
 
 ```sh
-cargo install --path ../solidity-lsp
+cargo install --path ../solidity-lsp --locked
 ```
 
 ## Install (dev)

@@ -9,7 +9,7 @@ resolves imports exactly like `forge build`.
 The `solidity-lsp` server binary on your `PATH` (or set `solidity.serverPath`):
 
 ```sh
-cargo install --path ../solidity-lsp   # or use a release binary
+cargo install --path ../solidity-lsp --locked   # or use a release binary
 ```
 
 ## Develop

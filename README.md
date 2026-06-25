@@ -25,10 +25,11 @@ This is one shared server that fixes all three: identical everywhere, current so
 Build and install the server binary (requires Rust and `forge` on your `PATH`):
 
 ```sh
-cargo install --path solidity-lsp
+cargo install --path solidity-lsp --locked
 ```
 
-This puts `solidity-lsp` on your `PATH`. It auto-downloads the solc version your
+This puts `solidity-lsp` on your `PATH`. (`--locked` uses the pinned
+`Cargo.lock`; required on Rust < 1.95.) It auto-downloads the solc version your
 project pins (via svm) on first compile.
 
 ## Editor setup
