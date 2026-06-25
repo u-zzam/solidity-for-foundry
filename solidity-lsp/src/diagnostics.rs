@@ -51,6 +51,12 @@ impl<'a> PositionMapper<'a> {
     }
 }
 
+/// The range covering the whole document, for full-text replacement edits.
+pub fn full_range(text: &str) -> Range {
+    let end = PositionMapper::new(text).position(text.len());
+    Range::new(Position::new(0, 0), end)
+}
+
 fn severity(s: Severity) -> DiagnosticSeverity {
     match s {
         Severity::Error => DiagnosticSeverity::ERROR,

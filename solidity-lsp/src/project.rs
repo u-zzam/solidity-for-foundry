@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use std::collections::HashSet;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 use foundry_compilers::artifacts::{Error as SolcError, EvmVersion, Optimizer, Remapping, Settings};
 use foundry_compilers::solc::{Solc, SolcCompiler, SolcLanguage, SolcSettings};
@@ -29,6 +31,32 @@ fn error_code(s: &str) -> Option<u64> {
         "transient-storage" => Some(2394),
         _ => s.parse().ok(),
     }
+}
+
+/// Format `src` with `forge fmt`, honoring the project's `[fmt]` config (via
+/// `--root`). Returns `None` if forge is unavailable or the input doesn't parse.
+pub fn format(root: Option<&Path>, src: &str) -> Option<String> {
+    let mut cmd = Command::new("forge");
+    cmd.arg("fmt").arg("--raw").arg("-");
+    if let Some(r) = root {
+        cmd.arg("--root").arg(r);
+    }
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+
+    let mut child = cmd.spawn().ok()?;
+    // Feed stdin from a thread so a large formatted result on stdout can't
+    // fill the pipe and deadlock us mid-write.
+    let mut stdin = child.stdin.take()?;
+    let buf = src.as_bytes().to_vec();
+    let writer = std::thread::spawn(move || stdin.write_all(&buf));
+    let out = child.wait_with_output().ok()?;
+    let _ = writer.join();
+
+    if !out.status.success() {
+        return None;
+    }
+    let formatted = String::from_utf8(out.stdout).ok()?;
+    (!formatted.is_empty()).then_some(formatted)
 }
 
 /// Walk up from a file (or dir) to the nearest directory containing `foundry.toml`.

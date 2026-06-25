@@ -107,6 +107,7 @@ impl LanguageServer for Backend {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),
+                document_formatting_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
         })
@@ -120,6 +121,29 @@ impl LanguageServer for Backend {
 
     async fn shutdown(&self) -> Result<()> {
         Ok(())
+    }
+
+    async fn formatting(
+        &self,
+        params: DocumentFormattingParams,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        let uri = params.text_document.uri;
+        let Some(text) = self.state.docs.read().await.get(&uri).cloned() else {
+            return Ok(None);
+        };
+        let root = uri.to_file_path().ok().and_then(|p| project::locate_root(&p));
+        let src = text.clone();
+        let formatted =
+            tokio::task::spawn_blocking(move || project::format(root.as_deref(), &src))
+                .await
+                .ok()
+                .flatten();
+        Ok(formatted.map(|new_text| {
+            vec![TextEdit {
+                range: diagnostics::full_range(&text),
+                new_text,
+            }]
+        }))
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
