@@ -32,12 +32,30 @@ struct State {
     index: RwLock<HashMap<PathBuf, index::Index>>,
     /// Roots whose full index compile is in flight, so repeated saves of one
     /// project don't pile up while a different project can still index
-    /// concurrently (single-flight per root, not globally).
-    indexing: Mutex<HashSet<PathBuf>>,
+    /// concurrently (single-flight per root, not globally). A std mutex so the
+    /// RAII guard can clear a root on drop (including on panic) without awaiting.
+    indexing: std::sync::Mutex<HashSet<PathBuf>>,
     /// Latest document version per URI, to debounce live as-you-type checks.
     live_versions: Mutex<HashMap<Url, i32>>,
     /// forge lint quick-fixes from the last compile, per URI, for code actions.
     fixes: Mutex<HashMap<Url, Vec<diagnostics::LintFix>>>,
+}
+
+/// Clears a root from the in-flight indexing set when dropped, so a panic during
+/// the build can't leave the root permanently blocked from re-indexing.
+struct IndexingGuard {
+    state: Arc<State>,
+    root: PathBuf,
+}
+
+impl Drop for IndexingGuard {
+    fn drop(&mut self) {
+        self.state
+            .indexing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.root);
+    }
 }
 
 impl Backend {
@@ -151,9 +169,15 @@ impl Backend {
         let Some(root) = project::locate_root(&path) else {
             return;
         };
-        if !self.state.indexing.lock().await.insert(root.clone()) {
-            return; // this root is already being indexed
+        {
+            let mut inflight = self.state.indexing.lock().unwrap_or_else(|e| e.into_inner());
+            if !inflight.insert(root.clone()) {
+                return; // this root is already being indexed
+            }
         }
+        // Clear the in-flight marker on every exit path (including a panic in any
+        // of the awaits below), so a failed build never blocks re-indexing.
+        let _guard = IndexingGuard { state: self.state.clone(), root: root.clone() };
 
         // Show "Indexing…" in the editor so navigation-not-ready reads as
         // in-progress, not broken, during the full compile.
@@ -195,7 +219,6 @@ impl Backend {
                     .await;
             }
         }
-        self.state.indexing.lock().await.remove(&root);
     }
 
     /// Begin a work-done progress (shown in the editor's status bar).
