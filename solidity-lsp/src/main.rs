@@ -179,6 +179,7 @@ impl LanguageServer for Backend {
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
+                rename_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
         })
@@ -266,6 +267,18 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         Ok(Some(idx.workspace_symbols(&params.query)))
+    }
+
+    async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
+        let p = params.text_document_position;
+        let Ok(path) = p.text_document.uri.to_file_path() else {
+            return Ok(None);
+        };
+        let guard = self.state.index.read().await;
+        let Some(idx) = guard.as_ref() else {
+            return Ok(None);
+        };
+        Ok(idx.rename(&path, p.position, &params.new_name))
     }
 
     async fn formatting(

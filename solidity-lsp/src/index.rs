@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 use tower_lsp::lsp_types::{
-    DocumentSymbol, Location, Position, Range, SymbolInformation, SymbolKind, Url,
+    DocumentSymbol, Location, Position, Range, SymbolInformation, SymbolKind, TextEdit, Url,
+    WorkspaceEdit,
 };
 
 use crate::diagnostics::PositionMapper;
@@ -184,6 +185,32 @@ impl Index {
             }
         }
         Some(md)
+    }
+
+    /// Rename the declaration under the cursor everywhere it is referenced.
+    pub fn rename(&self, path: &Path, pos: Position, new_name: &str) -> Option<WorkspaceEdit> {
+        let id = self.resolve(path, pos)?;
+        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+        let mut push = |loc: Location| {
+            changes.entry(loc.uri).or_default().push(TextEdit {
+                range: loc.range,
+                new_text: new_name.to_string(),
+            });
+        };
+        if let Some(refs) = self.refs_by_decl.get(&id) {
+            for r in refs {
+                if let Some(loc) = self.location(r.src_index, r.start, r.end) {
+                    push(loc);
+                }
+            }
+        }
+        if let Some(loc) = self.decl_location(id) {
+            push(loc);
+        }
+        (!changes.is_empty()).then(|| WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        })
     }
 
     pub fn document_symbols(&self, path: &Path) -> Vec<DocumentSymbol> {
