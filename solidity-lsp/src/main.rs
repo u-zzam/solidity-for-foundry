@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, RwLock};
@@ -24,10 +25,15 @@ struct State {
     published: Mutex<HashSet<Url>>,
     /// Serializes project compiles; one solc run at a time is plenty for an editor.
     compiling: Mutex<()>,
-    /// Navigation index from the last full compile.
-    index: RwLock<Option<index::Index>>,
-    /// Single-flights the full index compile so saves don't pile up.
-    index_lock: Mutex<()>,
+    /// Navigation index per Foundry root (keyed by the directory holding
+    /// foundry.toml), so several projects open at once — a monorepo with
+    /// multiple foundry.toml files — each keep their own index instead of
+    /// clobbering a single shared one.
+    index: RwLock<HashMap<PathBuf, index::Index>>,
+    /// Roots whose full index compile is in flight, so repeated saves of one
+    /// project don't pile up while a different project can still index
+    /// concurrently (single-flight per root, not globally).
+    indexing: Mutex<HashSet<PathBuf>>,
     /// Latest document version per URI, to debounce live as-you-type checks.
     live_versions: Mutex<HashMap<Url, i32>>,
     /// forge lint quick-fixes from the last compile, per URI, for code actions.
@@ -109,9 +115,10 @@ impl Backend {
     }
 
     /// Rebuild the navigation index from a full compile of the owning project.
-    /// Single-flighted: while one build runs, further requests are dropped (the
-    /// next save retriggers). The full compile is the cost of cross-file node-id
-    /// consistency; solar will make this live in a later phase.
+    /// Single-flighted per root: while one project's build runs, further
+    /// requests for the same root are dropped (the next save retriggers), but a
+    /// different project can index concurrently. The full compile is the cost of
+    /// cross-file node-id consistency; solar will make this live in a later phase.
     async fn build_index(&self, uri: Url) {
         let Ok(path) = uri.to_file_path() else {
             return;
@@ -122,9 +129,9 @@ impl Backend {
         let Some(root) = project::locate_root(&path) else {
             return;
         };
-        let Ok(_guard) = self.state.index_lock.try_lock() else {
-            return;
-        };
+        if !self.state.indexing.lock().await.insert(root.clone()) {
+            return; // this root is already being indexed
+        }
 
         // Show "Indexing…" in the editor so navigation-not-ready reads as
         // in-progress, not broken, during the full compile.
@@ -142,7 +149,7 @@ impl Backend {
         self.progress_end(token).await;
         match built {
             Ok(Ok(Some(idx))) => {
-                *self.state.index.write().await = Some(idx);
+                self.state.index.write().await.insert(root.clone(), idx);
                 self.client
                     .log_message(MessageType::INFO, format!("indexed {}", root.display()))
                     .await;
@@ -166,6 +173,7 @@ impl Backend {
                     .await;
             }
         }
+        self.state.indexing.lock().await.remove(&root);
     }
 
     /// Begin a work-done progress (shown in the editor's status bar).
@@ -334,8 +342,11 @@ impl LanguageServer for Backend {
         let Ok(path) = p.text_document.uri.to_file_path() else {
             return Ok(None);
         };
+        let Some(root) = project::locate_root(&path) else {
+            return Ok(None);
+        };
         let guard = self.state.index.read().await;
-        let Some(idx) = guard.as_ref() else {
+        let Some(idx) = guard.get(&root) else {
             return Ok(None);
         };
         Ok(idx
@@ -348,8 +359,11 @@ impl LanguageServer for Backend {
         let Ok(path) = p.text_document.uri.to_file_path() else {
             return Ok(None);
         };
+        let Some(root) = project::locate_root(&path) else {
+            return Ok(None);
+        };
         let guard = self.state.index.read().await;
-        let Some(idx) = guard.as_ref() else {
+        let Some(idx) = guard.get(&root) else {
             return Ok(None);
         };
         let locs = idx.references(&path, p.position, params.context.include_declaration);
@@ -361,8 +375,11 @@ impl LanguageServer for Backend {
         let Ok(path) = p.text_document.uri.to_file_path() else {
             return Ok(None);
         };
+        let Some(root) = project::locate_root(&path) else {
+            return Ok(None);
+        };
         let guard = self.state.index.read().await;
-        let Some(idx) = guard.as_ref() else {
+        let Some(idx) = guard.get(&root) else {
             return Ok(None);
         };
         Ok(idx.hover(&path, p.position).map(|value| Hover {
@@ -381,8 +398,11 @@ impl LanguageServer for Backend {
         let Ok(path) = params.text_document.uri.to_file_path() else {
             return Ok(None);
         };
+        let Some(root) = project::locate_root(&path) else {
+            return Ok(None);
+        };
         let guard = self.state.index.read().await;
-        let Some(idx) = guard.as_ref() else {
+        let Some(idx) = guard.get(&root) else {
             return Ok(None);
         };
         let syms = idx.document_symbols(&path);
@@ -393,11 +413,11 @@ impl LanguageServer for Backend {
         &self,
         params: WorkspaceSymbolParams,
     ) -> Result<Option<Vec<SymbolInformation>>> {
+        // Search every open project's index so workspace symbols span a monorepo.
         let guard = self.state.index.read().await;
-        let Some(idx) = guard.as_ref() else {
-            return Ok(None);
-        };
-        Ok(Some(idx.workspace_symbols(&params.query)))
+        let out: Vec<SymbolInformation> =
+            guard.values().flat_map(|idx| idx.workspace_symbols(&params.query)).collect();
+        Ok(Some(out))
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
@@ -405,9 +425,12 @@ impl LanguageServer for Backend {
         let Some(text) = self.state.docs.read().await.get(&p.text_document.uri).cloned() else {
             return Ok(None);
         };
+        let Some(root) = p.text_document.uri.to_file_path().ok().and_then(|path| project::locate_root(&path)) else {
+            return Ok(None);
+        };
         let offset = diagnostics::PositionMapper::new(&text).offset(p.position);
         let guard = self.state.index.read().await;
-        let Some(idx) = guard.as_ref() else {
+        let Some(idx) = guard.get(&root) else {
             return Ok(None);
         };
         let items = match member_context(&text, offset) {
@@ -422,12 +445,15 @@ impl LanguageServer for Backend {
         let Some(text) = self.state.docs.read().await.get(&p.text_document.uri).cloned() else {
             return Ok(None);
         };
+        let Some(root) = p.text_document.uri.to_file_path().ok().and_then(|path| project::locate_root(&path)) else {
+            return Ok(None);
+        };
         let offset = diagnostics::PositionMapper::new(&text).offset(p.position);
         let Some((callee, active)) = call_context(&text, offset) else {
             return Ok(None);
         };
         let guard = self.state.index.read().await;
-        let Some(idx) = guard.as_ref() else {
+        let Some(idx) = guard.get(&root) else {
             return Ok(None);
         };
         Ok(idx.signatures(&callee, active))
@@ -481,8 +507,10 @@ impl LanguageServer for Backend {
                     let name = slice(&text, d.range);
                     if !name.is_empty() && name.bytes().all(is_ident_byte) {
                         let from = uri.to_file_path().ok();
+                        let root = from.as_deref().and_then(project::locate_root);
                         let guard = self.state.index.read().await;
-                        if let (Some(idx), Some(from)) = (guard.as_ref(), from) {
+                        let idx = root.as_ref().and_then(|r| guard.get(r));
+                        if let (Some(idx), Some(from)) = (idx, from) {
                             let at = Position::new(import_line(&text), 0);
                             for cand in idx.import_candidates(&name) {
                                 let Some(rel) = relative_import(&from, &cand) else {
@@ -511,8 +539,11 @@ impl LanguageServer for Backend {
         let Ok(path) = params.text_document.uri.to_file_path() else {
             return Ok(None);
         };
+        let Some(root) = project::locate_root(&path) else {
+            return Ok(None);
+        };
         let guard = self.state.index.read().await;
-        let Some(idx) = guard.as_ref() else {
+        let Some(idx) = guard.get(&root) else {
             return Ok(None);
         };
         let data = idx.semantic_tokens(&path);
@@ -524,8 +555,11 @@ impl LanguageServer for Backend {
         let Ok(path) = params.text_document.uri.to_file_path() else {
             return Ok(None);
         };
+        let Some(root) = project::locate_root(&path) else {
+            return Ok(None);
+        };
         let guard = self.state.index.read().await;
-        let Some(idx) = guard.as_ref() else {
+        let Some(idx) = guard.get(&root) else {
             return Ok(None);
         };
         let hints = idx.inlay_hints(&path, params.range);
@@ -537,8 +571,11 @@ impl LanguageServer for Backend {
         let Ok(path) = p.text_document.uri.to_file_path() else {
             return Ok(None);
         };
+        let Some(root) = project::locate_root(&path) else {
+            return Ok(None);
+        };
         let guard = self.state.index.read().await;
-        let Some(idx) = guard.as_ref() else {
+        let Some(idx) = guard.get(&root) else {
             return Ok(None);
         };
         Ok(idx.rename(&path, p.position, &params.new_name))
