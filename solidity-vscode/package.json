@@ -1,0 +1,46 @@
+{
+  "name": "solidity-foundry",
+  "displayName": "Solidity (Foundry)",
+  "description": "Foundry-native Solidity language server: diagnostics, formatting and navigation on your project's exact solc version.",
+  "version": "0.1.0",
+  "license": "MIT",
+  "publisher": "foundry",
+  "repository": { "type": "git", "url": "https://github.com/foundry-rs/solidity" },
+  "engines": { "vscode": "^1.75.0" },
+  "categories": ["Programming Languages"],
+  "activationEvents": ["onLanguage:solidity"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "solidity",
+        "aliases": ["Solidity"],
+        "extensions": [".sol"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "configuration": {
+      "title": "Solidity (Foundry)",
+      "properties": {
+        "solidity.serverPath": {
+          "type": "string",
+          "default": "solidity-lsp",
+          "description": "Path to the solidity-lsp server binary (looked up on PATH by default)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/vscode": "^1.75.0",
+    "typescript": "^5.4.0"
+  }
+}
