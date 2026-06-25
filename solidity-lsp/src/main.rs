@@ -502,26 +502,17 @@ impl LanguageServer for Backend {
             // Missing SPDX is suppressed in diagnostics to match `forge build`,
             // so offer the fix from the buffer when editing near the top.
             if req.start.line <= 2 && !text.contains("SPDX-License-Identifier") {
-                let top = Range::new(Position::new(0, 0), Position::new(0, 0));
-                actions.push(quickfix(
-                    &uri,
-                    top,
-                    "// SPDX-License-Identifier: MIT\n".to_string(),
-                    "Add SPDX license identifier".to_string(),
-                ));
+                let (range, new_text) = header_edit(&text, 0, "// SPDX-License-Identifier: MIT");
+                actions.push(quickfix(&uri, range, new_text, "Add SPDX license identifier".into()));
             }
 
             for d in &params.context.diagnostics {
                 // Missing pragma: solc names the exact pragma to add.
                 if diag_code_is(d, 3420) {
                     if let Some(pragma) = pragma_from_message(&d.message) {
-                        let at = Position::new(spdx_line(&text).map_or(0, |l| l + 1), 0);
-                        actions.push(quickfix(
-                            &uri,
-                            Range::new(at, at),
-                            format!("{pragma}\n"),
-                            format!("Add `{pragma}`"),
-                        ));
+                        let line = spdx_line(&text).map_or(0, |l| l + 1);
+                        let (range, new_text) = header_edit(&text, line, &pragma);
+                        actions.push(quickfix(&uri, range, new_text, format!("Add `{pragma}`")));
                     }
                 }
                 // Undeclared identifier: suggest importing it from where it lives.
@@ -533,15 +524,20 @@ impl LanguageServer for Backend {
                         let guard = self.state.index.read().await;
                         let idx = root.as_ref().and_then(|r| guard.get(r));
                         if let (Some(idx), Some(from)) = (idx, from) {
-                            let at = Position::new(import_line(&text), 0);
                             for cand in idx.import_candidates(&name) {
+                                if cand == from {
+                                    continue; // never import a file into itself
+                                }
                                 let Some(rel) = relative_import(&from, &cand) else {
                                     continue;
                                 };
+                                let stmt = format!("import {{{name}}} from \"{rel}\";");
+                                let (range, new_text) =
+                                    header_edit(&text, import_line(&text), &stmt);
                                 actions.push(quickfix(
                                     &uri,
-                                    Range::new(at, at),
-                                    format!("import {{{name}}} from \"{rel}\";\n"),
+                                    range,
+                                    new_text,
                                     format!("Import `{name}` from \"{rel}\""),
                                 ));
                             }
@@ -707,6 +703,21 @@ fn import_line(text: &str) -> u32 {
     after
 }
 
+/// A text edit inserting `stmt` (without a trailing newline) as its own line at
+/// 0-based `line`. If that line is past the end of a file with no trailing
+/// newline, append after the last line with a leading newline so the statement
+/// isn't jammed onto existing code.
+fn header_edit(text: &str, line: u32, stmt: &str) -> (Range, String) {
+    let newlines = text.matches('\n').count() as u32;
+    if line <= newlines {
+        let at = Position::new(line, 0);
+        (Range::new(at, at), format!("{stmt}\n"))
+    } else {
+        let end = diagnostics::PositionMapper::new(text).position(text.len());
+        (Range::new(end, end), format!("\n{stmt}"))
+    }
+}
+
 /// The document text covered by an LSP range.
 fn slice(text: &str, range: Range) -> String {
     let m = diagnostics::PositionMapper::new(text);
@@ -806,8 +817,24 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{call_context, import_line, member_context, pragma_from_message, relative_import};
+    use super::{
+        call_context, header_edit, import_line, member_context, pragma_from_message,
+        relative_import,
+    };
     use std::path::Path;
+    use tower_lsp::lsp_types::Position;
+
+    #[test]
+    fn header_edit_handles_missing_trailing_newline() {
+        // Normal: insert as its own line.
+        let (r, t) = header_edit("a\nb\n", 1, "X");
+        assert_eq!(r.start, Position::new(1, 0));
+        assert_eq!(t, "X\n");
+        // Past EOF with no trailing newline: append after the last line.
+        let (r, t) = header_edit("pragma solidity 0.8.35;", 1, "import {Foo} from \"./F.sol\";");
+        assert_eq!(r.start, Position::new(0, 23));
+        assert_eq!(t, "\nimport {Foo} from \"./F.sol\";");
+    }
 
     #[test]
     fn pragma_extracted_from_solc_message() {
