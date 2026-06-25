@@ -49,6 +49,13 @@ fn error_code(s: &str) -> Option<u64> {
     }
 }
 
+/// A fix `forge lint` suggests for a finding (replace a byte span with text).
+pub struct Suggestion {
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub text: String,
+}
+
 /// One `forge lint` finding (a solar lint), located by byte offsets.
 pub struct LintFinding {
     pub file: PathBuf,
@@ -57,6 +64,7 @@ pub struct LintFinding {
     pub level: String,
     pub code: Option<String>,
     pub message: String,
+    pub suggestion: Option<Suggestion>,
 }
 
 /// Run `forge lint --json` and parse its rustc-style NDJSON diagnostics. forge
@@ -105,6 +113,21 @@ pub fn lint(root: &Path) -> Vec<LintFinding> {
         ) else {
             continue;
         };
+        // A `consider using` child carries the suggested replacement + its span.
+        let suggestion = v.get("children").and_then(|c| c.as_array()).and_then(|children| {
+            children.iter().find_map(|child| {
+                child.get("spans").and_then(|s| s.as_array()).and_then(|spans| {
+                    spans.iter().find_map(|sp| {
+                        Some(Suggestion {
+                            byte_start: sp.get("byte_start")?.as_u64()? as usize,
+                            byte_end: sp.get("byte_end")?.as_u64()? as usize,
+                            text: sp.get("suggested_replacement")?.as_str()?.to_string(),
+                        })
+                    })
+                })
+            })
+        });
+
         findings.push(LintFinding {
             file: PathBuf::from(file),
             byte_start: bs as usize,
@@ -116,6 +139,7 @@ pub fn lint(root: &Path) -> Vec<LintFinding> {
                 .and_then(|c| c.as_str())
                 .map(String::from),
             message: v.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string(),
+            suggestion,
         });
     }
     findings

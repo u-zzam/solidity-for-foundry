@@ -180,6 +180,44 @@ pub fn group_lints(findings: &[LintFinding]) -> HashMap<Url, Vec<Diagnostic>> {
     out
 }
 
+/// A quick-fix derived from a `forge lint` suggestion.
+#[derive(Clone)]
+pub struct LintFix {
+    pub range: Range,
+    pub title: String,
+    pub new_text: String,
+}
+
+/// Build quick-fixes for lint findings that carry a suggested replacement,
+/// grouped by file URI.
+pub fn lint_fixes(findings: &[LintFinding]) -> HashMap<Url, Vec<LintFix>> {
+    let mut texts: HashMap<PathBuf, Option<String>> = HashMap::new();
+    let mut out: HashMap<Url, Vec<LintFix>> = HashMap::new();
+    for f in findings {
+        let Some(s) = &f.suggestion else {
+            continue;
+        };
+        let Ok(uri) = Url::from_file_path(&f.file) else {
+            continue;
+        };
+        let text = texts
+            .entry(f.file.clone())
+            .or_insert_with(|| std::fs::read_to_string(&f.file).ok())
+            .clone();
+        let mapper = PositionMapper::new(text.as_deref().unwrap_or(""));
+        let title = match &f.code {
+            Some(c) => format!("{c}: replace with `{}`", s.text),
+            None => format!("Replace with `{}`", s.text),
+        };
+        out.entry(uri).or_default().push(LintFix {
+            range: Range::new(mapper.position(s.byte_start), mapper.position(s.byte_end)),
+            title,
+            new_text: s.text.clone(),
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

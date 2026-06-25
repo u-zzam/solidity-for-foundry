@@ -30,6 +30,8 @@ struct State {
     index_lock: Mutex<()>,
     /// Latest document version per URI, to debounce live as-you-type checks.
     live_versions: Mutex<HashMap<Url, i32>>,
+    /// forge lint quick-fixes from the last compile, per URI, for code actions.
+    fixes: Mutex<HashMap<Url, Vec<diagnostics::LintFix>>>,
 }
 
 impl Backend {
@@ -79,6 +81,7 @@ impl Backend {
         for (uri, mut ds) in diagnostics::group_lints(&lints) {
             new.entry(uri).or_default().append(&mut ds);
         }
+        *self.state.fixes.lock().await = diagnostics::lint_fixes(&lints);
 
         let total: usize = new.values().map(Vec::len).sum();
         self.client
@@ -248,6 +251,7 @@ impl LanguageServer for Backend {
                     trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
                     ..Default::default()
                 }),
+                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 ..Default::default()
             },
         })
@@ -370,6 +374,42 @@ impl LanguageServer for Backend {
         Ok(idx.signatures(&callee, active))
     }
 
+    async fn code_action(
+        &self,
+        params: CodeActionParams,
+    ) -> Result<Option<CodeActionResponse>> {
+        let uri = params.text_document.uri;
+        let req = params.range;
+        let fixes = self.state.fixes.lock().await;
+        let Some(file_fixes) = fixes.get(&uri) else {
+            return Ok(None);
+        };
+        let actions: Vec<CodeActionOrCommand> = file_fixes
+            .iter()
+            .filter(|f| ranges_overlap(f.range, req))
+            .map(|f| {
+                let mut changes = HashMap::new();
+                changes.insert(
+                    uri.clone(),
+                    vec![TextEdit {
+                        range: f.range,
+                        new_text: f.new_text.clone(),
+                    }],
+                );
+                CodeActionOrCommand::CodeAction(CodeAction {
+                    title: f.title.clone(),
+                    kind: Some(CodeActionKind::QUICKFIX),
+                    edit: Some(WorkspaceEdit {
+                        changes: Some(changes),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        Ok((!actions.is_empty()).then_some(actions))
+    }
+
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
         let p = params.text_document_position;
         let Ok(path) = p.text_document.uri.to_file_path() else {
@@ -431,6 +471,12 @@ impl LanguageServer for Backend {
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         self.state.docs.write().await.remove(&params.text_document.uri);
     }
+}
+
+/// Whether two LSP ranges intersect (touching counts), so a code action is
+/// offered when the cursor/selection meets a fix's span.
+fn ranges_overlap(a: Range, b: Range) -> bool {
+    a.start <= b.end && b.start <= a.end
 }
 
 fn is_ident_byte(b: u8) -> bool {
