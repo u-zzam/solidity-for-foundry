@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Local tooling state
+.gstack/
+
+# Node (VS Code client)
+node_modules/
+solidity-vscode/out/
+*.vsix
+
+# Zed client build
+solidity-zed/target/

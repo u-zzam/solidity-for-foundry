@@ -1,0 +1,9 @@
+[package]
+name = "solidity-lsp"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Foundry-native Solidity language server"
+repository = "https://github.com/foundry-rs/solidity"
+
+[dependencies]

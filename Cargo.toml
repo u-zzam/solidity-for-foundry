@@ -1,0 +1,3 @@
+[workspace]
+members = ["solidity-lsp"]
+resolver = "2"
