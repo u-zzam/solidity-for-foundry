@@ -12,7 +12,9 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use foundry_compilers::artifacts::{Error as SolcError, EvmVersion, Optimizer, Remapping, Settings};
+use foundry_compilers::artifacts::{
+    Error as SolcError, EvmVersion, Optimizer, Remapping, Settings, Source,
+};
 use foundry_compilers::solc::{Solc, SolcCompiler, SolcLanguage, SolcSettings};
 use foundry_compilers::{ProjectBuilder, ProjectPathsConfig};
 use semver::Version;
@@ -296,43 +298,19 @@ fn resolve_remappings(root: &Path, cfg: &Config) -> Vec<Remapping> {
     map.into_values().collect()
 }
 
-/// Compile the project rooted at `root`, returning diagnostics (with the same
-/// warning suppression `forge build` applies) and the per-source ASTs.
-///
-/// `full` bypasses the incremental cache so solc compiles every file in one
-/// invocation. That is required for the navigation index, where node ids and
-/// source indices must be consistent across all files (they are assigned per
-/// compilation). Diagnostics use the fast cached path (`full = false`).
-pub fn compile(root: &Path, full: bool) -> Result<CompileOutput, String> {
-    let cfg = parse_config(root);
-
-    let paths: ProjectPathsConfig<SolcLanguage> = ProjectPathsConfig::builder()
+fn build_paths(root: &Path, cfg: &Config) -> Result<ProjectPathsConfig<SolcLanguage>, String> {
+    ProjectPathsConfig::builder()
         .root(root)
         .sources(root.join(&cfg.src))
         .tests(root.join(&cfg.tests))
         .scripts(root.join(&cfg.scripts))
         .libs(cfg.libs.iter().map(|l| root.join(l)))
-        .remappings(resolve_remappings(root, &cfg))
+        .remappings(resolve_remappings(root, cfg))
         .build()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())
+}
 
-    // Isolate our build cache/artifacts from the user's `out/` so we never race
-    // `forge build`; `cache/` is gitignored by every Foundry project. The index
-    // uses a separate, wiped cache so it always gets a cold, full compile (all
-    // files in one solc run -> consistent node ids); diagnostics reuse a warm
-    // cache for fast incremental rebuilds.
-    let mut paths = paths;
-    let work = if full {
-        let dir = root.join("cache").join("solidity-lsp-index");
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
-    } else {
-        root.join("cache").join("solidity-lsp")
-    };
-    paths.cache = work.join("solidity-files-cache.json");
-    paths.artifacts = work.join("out");
-    paths.build_infos = work.join("out").join("build-info");
-
+fn build_settings(cfg: &Config) -> Settings {
     let mut settings = Settings::default();
     settings.optimizer = Optimizer {
         enabled: cfg.optimizer,
@@ -343,33 +321,19 @@ pub fn compile(root: &Path, full: bool) -> Result<CompileOutput, String> {
     if let Some(evm) = cfg.evm_version {
         settings.evm_version = Some(evm);
     }
+    settings
+}
 
-    let compiler = match &cfg.solc {
+fn build_compiler(cfg: &Config) -> Result<SolcCompiler, String> {
+    Ok(match &cfg.solc {
         Some(v) => SolcCompiler::Specific(Solc::find_or_install(v).map_err(|e| e.to_string())?),
         None => SolcCompiler::AutoDetect,
-    };
+    })
+}
 
-    let project = ProjectBuilder::<SolcCompiler>::default()
-        .paths(paths)
-        .settings(SolcSettings { settings, cli_settings: Default::default() })
-        .build(compiler)
-        .map_err(|e| e.to_string())?;
-
-    let output = project.compile().map_err(|e| e.to_string())?.into_output();
-
-    let mut sources = Vec::new();
-    for (path, sf) in output.sources.sources() {
-        if let Some(ast) = &sf.ast {
-            if let Ok(value) = serde_json::to_value(ast) {
-                let abs = if path.is_absolute() { path.clone() } else { root.join(path) };
-                sources.push(SourceAst { index: sf.id as usize, path: abs, ast: value });
-            }
-        }
-    }
-    let mut errors = output.errors;
-
-    // Apply forge's display filtering: suppress warnings with an ignored code or
-    // from an ignored path. Errors always surface.
+/// Apply forge's display filtering: suppress warnings with an ignored code or
+/// from an ignored path. Errors always surface.
+fn filter_errors(mut errors: Vec<SolcError>, root: &Path, cfg: &Config) -> Vec<SolcError> {
     let ignored_codes: HashSet<u64> = cfg.ignored_error_codes.iter().copied().collect();
     let ignored_paths: Vec<PathBuf> = cfg.ignored_warnings_from.iter().map(|p| root.join(p)).collect();
     errors.retain(|e| {
@@ -387,6 +351,90 @@ pub fn compile(root: &Path, full: bool) -> Result<CompileOutput, String> {
         }
         true
     });
+    errors
+}
 
+/// Compile the project rooted at `root`, returning diagnostics (with the same
+/// warning suppression `forge build` applies) and the per-source ASTs.
+///
+/// `full` bypasses the incremental cache so solc compiles every file in one
+/// invocation. That is required for the navigation index, where node ids and
+/// source indices must be consistent across all files (they are assigned per
+/// compilation). Diagnostics use the fast cached path (`full = false`).
+pub fn compile(root: &Path, full: bool) -> Result<CompileOutput, String> {
+    let cfg = parse_config(root);
+    let mut paths = build_paths(root, &cfg)?;
+
+    // Isolate our build cache/artifacts from the user's `out/` so we never race
+    // `forge build`; `cache/` is gitignored by every Foundry project. The index
+    // uses a separate, wiped cache so it always gets a cold, full compile (all
+    // files in one solc run -> consistent node ids); diagnostics reuse a warm
+    // cache for fast incremental rebuilds.
+    let work = if full {
+        let dir = root.join("cache").join("solidity-lsp-index");
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    } else {
+        root.join("cache").join("solidity-lsp")
+    };
+    paths.cache = work.join("solidity-files-cache.json");
+    paths.artifacts = work.join("out");
+    paths.build_infos = work.join("out").join("build-info");
+
+    let project = ProjectBuilder::<SolcCompiler>::default()
+        .paths(paths)
+        .settings(SolcSettings { settings: build_settings(&cfg), cli_settings: Default::default() })
+        .build(build_compiler(&cfg)?)
+        .map_err(|e| e.to_string())?;
+
+    let output = project.compile().map_err(|e| e.to_string())?.into_output();
+
+    let mut sources = Vec::new();
+    for (path, sf) in output.sources.sources() {
+        if let Some(ast) = &sf.ast {
+            if let Ok(value) = serde_json::to_value(ast) {
+                let abs = if path.is_absolute() { path.clone() } else { root.join(path) };
+                sources.push(SourceAst { index: sf.id as usize, path: abs, ast: value });
+            }
+        }
+    }
+    let errors = filter_errors(output.errors, root, &cfg);
     Ok(CompileOutput { errors, sources })
+}
+
+/// Type-check the unsaved `buffer` for `target` against the project's imports,
+/// for live (as-you-type) diagnostics. Builds solc's standard-json input from
+/// the on-disk import graph, swaps in the buffer, and type-checks with no
+/// codegen (so via-ir projects stay fast). Requires a pinned solc version.
+pub fn check_buffer(root: &Path, target: &Path, buffer: &str) -> Result<Vec<SolcError>, String> {
+    let cfg = parse_config(root);
+    let version = cfg.solc.clone().ok_or("project does not pin a solc version")?;
+    let solc = Solc::find_or_install(&version).map_err(|e| e.to_string())?;
+
+    let project = ProjectBuilder::<SolcCompiler>::default()
+        .paths(build_paths(root, &cfg)?)
+        .settings(SolcSettings { settings: build_settings(&cfg), cli_settings: Default::default() })
+        .build(SolcCompiler::Specific(solc.clone()))
+        .map_err(|e| e.to_string())?;
+
+    let mut input = project.standard_json_input(target).map_err(|e| e.to_string())?;
+    // Type-check only: an empty output selection skips codegen.
+    input.settings.output_selection = Default::default();
+
+    // Swap the edited file's on-disk content for the unsaved buffer.
+    let rel = target.strip_prefix(root).unwrap_or(target);
+    let mut found = false;
+    for (p, source) in input.sources.iter_mut() {
+        if p == rel || p == target {
+            *source = Source::new(buffer);
+            found = true;
+        }
+    }
+    if !found {
+        return Err("target is not in the project source graph".to_string());
+    }
+
+    let input = input.normalize_evm_version(&version);
+    let output = solc.compile(&input).map_err(|e| e.to_string())?;
+    Ok(filter_errors(output.errors, root, &cfg))
 }

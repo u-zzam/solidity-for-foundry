@@ -28,6 +28,8 @@ struct State {
     index: RwLock<Option<index::Index>>,
     /// Single-flights the full index compile so saves don't pile up.
     index_lock: Mutex<()>,
+    /// Latest document version per URI, to debounce live as-you-type checks.
+    live_versions: Mutex<HashMap<Url, i32>>,
 }
 
 impl Backend {
@@ -168,6 +170,54 @@ impl Backend {
     fn schedule_index(&self, uri: Url) {
         let me = self.clone();
         tokio::spawn(async move { me.build_index(uri).await });
+    }
+
+    /// Debounce, then type-check the live buffer for fast as-you-type feedback.
+    fn schedule_live_check(&self, uri: Url, version: i32) {
+        let me = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            // Skip if a newer edit landed during the debounce window.
+            if me.state.live_versions.lock().await.get(&uri).copied() != Some(version) {
+                return;
+            }
+            me.live_check(uri).await;
+        });
+    }
+
+    /// Type-check the unsaved buffer and publish the edited file's diagnostics.
+    /// Silently no-ops if the project doesn't pin solc; on-save still covers it.
+    async fn live_check(&self, uri: Url) {
+        let Ok(path) = uri.to_file_path() else {
+            return;
+        };
+        if path.extension().and_then(|e| e.to_str()) != Some("sol") {
+            return;
+        }
+        let Some(root) = project::locate_root(&path) else {
+            return;
+        };
+        let Some(buffer) = self.state.docs.read().await.get(&uri).cloned() else {
+            return;
+        };
+
+        let (r, t) = (root.clone(), path.clone());
+        let Ok(Ok(errors)) =
+            tokio::task::spawn_blocking(move || project::check_buffer(&r, &t, &buffer)).await
+        else {
+            return;
+        };
+
+        let diags = diagnostics::group(&errors, &root, &uri)
+            .remove(&uri)
+            .unwrap_or_default();
+        let mut published = self.state.published.lock().await;
+        if diags.is_empty() {
+            published.remove(&uri);
+        } else {
+            published.insert(uri.clone());
+        }
+        self.client.publish_diagnostics(uri, diags, None).await;
     }
 }
 
@@ -363,14 +413,14 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        let uri = params.text_document.uri;
+        let version = params.text_document.version;
         // FULL sync: the last change carries the entire document text.
         if let Some(change) = params.content_changes.into_iter().next_back() {
-            self.state
-                .docs
-                .write()
-                .await
-                .insert(params.text_document.uri, change.text);
+            self.state.docs.write().await.insert(uri.clone(), change.text);
         }
+        self.state.live_versions.lock().await.insert(uri.clone(), version);
+        self.schedule_live_check(uri, version);
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {

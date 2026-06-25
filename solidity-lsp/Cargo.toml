@@ -10,6 +10,6 @@ repository = "https://github.com/foundry-rs/solidity"
 foundry-compilers = { version = "0.19.14", features = ["svm-solc"] }
 semver = "1.0.28"
 serde_json = "1.0.150"
-tokio = { version = "1.47", features = ["rt-multi-thread", "io-std", "macros", "sync"] }
+tokio = { version = "1.47", features = ["rt-multi-thread", "io-std", "macros", "sync", "time"] }
 toml = "1.1.2"
 tower-lsp = "0.20"
