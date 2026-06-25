@@ -7,6 +7,7 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 mod diagnostics;
+mod index;
 mod project;
 
 #[derive(Clone)]
@@ -23,6 +24,10 @@ struct State {
     published: Mutex<HashSet<Url>>,
     /// Serializes project compiles; one solc run at a time is plenty for an editor.
     compiling: Mutex<()>,
+    /// Navigation index from the last full compile.
+    index: RwLock<Option<index::Index>>,
+    /// Single-flights the full index compile so saves don't pile up.
+    index_lock: Mutex<()>,
 }
 
 impl Backend {
@@ -46,8 +51,8 @@ impl Backend {
 
         let _guard = self.state.compiling.lock().await;
         let r = root.clone();
-        let errors = match tokio::task::spawn_blocking(move || project::compile(&r)).await {
-            Ok(Ok(errors)) => errors,
+        let errors = match tokio::task::spawn_blocking(move || project::compile(&r, false)).await {
+            Ok(Ok(out)) => out.errors,
             Ok(Err(e)) => {
                 self.client
                     .log_message(MessageType::ERROR, format!("compile failed: {e}"))
@@ -88,10 +93,71 @@ impl Backend {
         *published = new.into_keys().collect();
     }
 
-    /// Run diagnostics off the message loop so the server stays responsive.
+    /// Rebuild the navigation index from a full compile of the owning project.
+    /// Single-flighted: while one build runs, further requests are dropped (the
+    /// next save retriggers). The full compile is the cost of cross-file node-id
+    /// consistency; solar will make this live in a later phase.
+    async fn build_index(&self, uri: Url) {
+        let Ok(path) = uri.to_file_path() else {
+            return;
+        };
+        if path.extension().and_then(|e| e.to_str()) != Some("sol") {
+            return;
+        }
+        let Some(root) = project::locate_root(&path) else {
+            return;
+        };
+        let Ok(_guard) = self.state.index_lock.try_lock() else {
+            return;
+        };
+
+        let r = root.clone();
+        let built = tokio::task::spawn_blocking(move || {
+            project::compile(&r, true).map(|out| {
+                // solc emits no ASTs when the project has errors. Keep the last
+                // good index in that case so navigation stays usable (stale)
+                // while broken code is being edited.
+                (!out.sources.is_empty()).then(|| index::Index::build(&out.sources))
+            })
+        })
+        .await;
+        match built {
+            Ok(Ok(Some(idx))) => {
+                *self.state.index.write().await = Some(idx);
+                self.client
+                    .log_message(MessageType::INFO, format!("indexed {}", root.display()))
+                    .await;
+            }
+            Ok(Ok(None)) => {
+                self.client
+                    .log_message(
+                        MessageType::INFO,
+                        "index unchanged (project has compile errors)".to_string(),
+                    )
+                    .await;
+            }
+            Ok(Err(e)) => {
+                self.client
+                    .log_message(MessageType::ERROR, format!("index build failed: {e}"))
+                    .await;
+            }
+            Err(e) => {
+                self.client
+                    .log_message(MessageType::ERROR, format!("index task failed: {e}"))
+                    .await;
+            }
+        }
+    }
+
+    /// Run work off the message loop so the server stays responsive.
     fn schedule_diagnostics(&self, uri: Url) {
         let me = self.clone();
         tokio::spawn(async move { me.run_diagnostics(uri).await });
+    }
+
+    fn schedule_index(&self, uri: Url) {
+        let me = self.clone();
+        tokio::spawn(async move { me.build_index(uri).await });
     }
 }
 
@@ -108,6 +174,11 @@ impl LanguageServer for Backend {
                     TextDocumentSyncKind::FULL,
                 )),
                 document_formatting_provider: Some(OneOf::Left(true)),
+                definition_provider: Some(OneOf::Left(true)),
+                references_provider: Some(OneOf::Left(true)),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
+                document_symbol_provider: Some(OneOf::Left(true)),
+                workspace_symbol_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
         })
@@ -121,6 +192,80 @@ impl LanguageServer for Backend {
 
     async fn shutdown(&self) -> Result<()> {
         Ok(())
+    }
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let p = params.text_document_position_params;
+        let Ok(path) = p.text_document.uri.to_file_path() else {
+            return Ok(None);
+        };
+        let guard = self.state.index.read().await;
+        let Some(idx) = guard.as_ref() else {
+            return Ok(None);
+        };
+        Ok(idx
+            .definition(&path, p.position)
+            .map(GotoDefinitionResponse::Scalar))
+    }
+
+    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        let p = params.text_document_position;
+        let Ok(path) = p.text_document.uri.to_file_path() else {
+            return Ok(None);
+        };
+        let guard = self.state.index.read().await;
+        let Some(idx) = guard.as_ref() else {
+            return Ok(None);
+        };
+        let locs = idx.references(&path, p.position, params.context.include_declaration);
+        Ok((!locs.is_empty()).then_some(locs))
+    }
+
+    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        let p = params.text_document_position_params;
+        let Ok(path) = p.text_document.uri.to_file_path() else {
+            return Ok(None);
+        };
+        let guard = self.state.index.read().await;
+        let Some(idx) = guard.as_ref() else {
+            return Ok(None);
+        };
+        Ok(idx.hover(&path, p.position).map(|value| Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value,
+            }),
+            range: None,
+        }))
+    }
+
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> Result<Option<DocumentSymbolResponse>> {
+        let Ok(path) = params.text_document.uri.to_file_path() else {
+            return Ok(None);
+        };
+        let guard = self.state.index.read().await;
+        let Some(idx) = guard.as_ref() else {
+            return Ok(None);
+        };
+        let syms = idx.document_symbols(&path);
+        Ok((!syms.is_empty()).then_some(DocumentSymbolResponse::Nested(syms)))
+    }
+
+    async fn symbol(
+        &self,
+        params: WorkspaceSymbolParams,
+    ) -> Result<Option<Vec<SymbolInformation>>> {
+        let guard = self.state.index.read().await;
+        let Some(idx) = guard.as_ref() else {
+            return Ok(None);
+        };
+        Ok(Some(idx.workspace_symbols(&params.query)))
     }
 
     async fn formatting(
@@ -149,7 +294,8 @@ impl LanguageServer for Backend {
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let doc = params.text_document;
         self.state.docs.write().await.insert(doc.uri.clone(), doc.text);
-        self.schedule_diagnostics(doc.uri);
+        self.schedule_diagnostics(doc.uri.clone());
+        self.schedule_index(doc.uri);
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -164,7 +310,8 @@ impl LanguageServer for Backend {
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
-        self.schedule_diagnostics(params.text_document.uri);
+        self.schedule_diagnostics(params.text_document.uri.clone());
+        self.schedule_index(params.text_document.uri);
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {

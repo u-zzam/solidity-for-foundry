@@ -44,6 +44,29 @@ impl<'a> PositionMapper<'a> {
         Position::new(line as u32, character as u32)
     }
 
+    /// LSP position -> byte offset, clamped to the document. Inverse of `position`.
+    pub fn offset(&self, pos: Position) -> usize {
+        let line = pos.line as usize;
+        let Some(&line_start) = self.line_starts.get(line) else {
+            return self.text.len();
+        };
+        let line_end = self
+            .line_starts
+            .get(line + 1)
+            .copied()
+            .unwrap_or(self.text.len());
+        let mut utf16 = 0u32;
+        let mut byte = line_start;
+        for c in self.text[line_start..line_end].chars() {
+            if utf16 >= pos.character {
+                break;
+            }
+            utf16 += c.len_utf16() as u32;
+            byte += c.len_utf8();
+        }
+        byte.min(self.text.len())
+    }
+
     pub fn range(&self, start: i32, end: i32) -> Range {
         let s = start.max(0) as usize;
         let e = (end.max(0) as usize).max(s);
@@ -138,6 +161,17 @@ mod tests {
         let nl = text.find('\n').unwrap();
         assert_eq!(m.position(nl + 1), Position::new(1, 0));
         assert_eq!(m.position(nl + 4), Position::new(1, 3)); // "sec"
+    }
+
+    #[test]
+    fn offset_roundtrips_position() {
+        let text = "let aé→b = 1;\nsecond line";
+        let m = PositionMapper::new(text);
+        for byte in [0usize, 4, 5, 7, 10, 11, text.find('\n').unwrap() + 1, text.len()] {
+            assert!(text.is_char_boundary(byte));
+            let pos = m.position(byte);
+            assert_eq!(m.offset(pos), byte, "byte {byte} via {pos:?}");
+        }
     }
 
     #[test]

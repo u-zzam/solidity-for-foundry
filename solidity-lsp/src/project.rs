@@ -17,6 +17,20 @@ use foundry_compilers::solc::{Solc, SolcCompiler, SolcLanguage, SolcSettings};
 use foundry_compilers::{ProjectBuilder, ProjectPathsConfig};
 use semver::Version;
 
+/// One source file's solc AST, as raw JSON for generic traversal, tagged with
+/// the source-unit index solc uses in `src` locations.
+pub struct SourceAst {
+    pub index: usize,
+    pub path: PathBuf,
+    pub ast: serde_json::Value,
+}
+
+/// Result of compiling a project: diagnostics plus the typed ASTs to index.
+pub struct CompileOutput {
+    pub errors: Vec<SolcError>,
+    pub sources: Vec<SourceAst>,
+}
+
 /// solc warning codes `forge build` suppresses by default: license (1878),
 /// code-size (5574), init-code-size (3860), transient-storage (2394).
 const DEFAULT_IGNORED_CODES: [u64; 4] = [1878, 5574, 3860, 2394];
@@ -210,10 +224,14 @@ fn resolve_remappings(root: &Path, cfg: &Config) -> Vec<Remapping> {
     map.into_values().collect()
 }
 
-/// Compile the project rooted at `root` and return solc's diagnostics, applying
-/// the same warning suppression `forge build` does (`ignored_error_codes` and
-/// `ignored_warnings_from`).
-pub fn compile(root: &Path) -> Result<Vec<SolcError>, String> {
+/// Compile the project rooted at `root`, returning diagnostics (with the same
+/// warning suppression `forge build` applies) and the per-source ASTs.
+///
+/// `full` bypasses the incremental cache so solc compiles every file in one
+/// invocation. That is required for the navigation index, where node ids and
+/// source indices must be consistent across all files (they are assigned per
+/// compilation). Diagnostics use the fast cached path (`full = false`).
+pub fn compile(root: &Path, full: bool) -> Result<CompileOutput, String> {
     let cfg = parse_config(root);
 
     let paths: ProjectPathsConfig<SolcLanguage> = ProjectPathsConfig::builder()
@@ -227,9 +245,18 @@ pub fn compile(root: &Path) -> Result<Vec<SolcError>, String> {
         .map_err(|e| e.to_string())?;
 
     // Isolate our build cache/artifacts from the user's `out/` so we never race
-    // `forge build`; `cache/` is gitignored by every Foundry project.
+    // `forge build`; `cache/` is gitignored by every Foundry project. The index
+    // uses a separate, wiped cache so it always gets a cold, full compile (all
+    // files in one solc run -> consistent node ids); diagnostics reuse a warm
+    // cache for fast incremental rebuilds.
     let mut paths = paths;
-    let work = root.join("cache").join("solidity-lsp");
+    let work = if full {
+        let dir = root.join("cache").join("solidity-lsp-index");
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    } else {
+        root.join("cache").join("solidity-lsp")
+    };
     paths.cache = work.join("solidity-files-cache.json");
     paths.artifacts = work.join("out");
     paths.build_infos = work.join("out").join("build-info");
@@ -256,7 +283,18 @@ pub fn compile(root: &Path) -> Result<Vec<SolcError>, String> {
         .build(compiler)
         .map_err(|e| e.to_string())?;
 
-    let mut errors = project.compile().map_err(|e| e.to_string())?.into_output().errors;
+    let output = project.compile().map_err(|e| e.to_string())?.into_output();
+
+    let mut sources = Vec::new();
+    for (path, sf) in output.sources.sources() {
+        if let Some(ast) = &sf.ast {
+            if let Ok(value) = serde_json::to_value(ast) {
+                let abs = if path.is_absolute() { path.clone() } else { root.join(path) };
+                sources.push(SourceAst { index: sf.id as usize, path: abs, ast: value });
+            }
+        }
+    }
+    let mut errors = output.errors;
 
     // Apply forge's display filtering: suppress warnings with an ignored code or
     // from an ignored path. Errors always surface.
@@ -278,5 +316,5 @@ pub fn compile(root: &Path) -> Result<Vec<SolcError>, String> {
         true
     });
 
-    Ok(errors)
+    Ok(CompileOutput { errors, sources })
 }
