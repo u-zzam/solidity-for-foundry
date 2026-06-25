@@ -14,8 +14,9 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, Documentation, DocumentSymbol, InlayHint, InlayHintKind,
-    InlayHintLabel, Location, ParameterInformation, ParameterLabel, Position, Range, SignatureHelp,
-    SignatureInformation, SymbolInformation, SymbolKind, TextEdit, Url, WorkspaceEdit,
+    InlayHintLabel, Location, ParameterInformation, ParameterLabel, Position, Range, SemanticToken,
+    SemanticTokenType, SignatureHelp, SignatureInformation, SymbolInformation, SymbolKind, TextEdit,
+    Url, WorkspaceEdit,
 };
 
 use crate::diagnostics::PositionMapper;
@@ -82,6 +83,8 @@ struct FileEntry {
     symbols: Vec<DocumentSymbol>,
     /// Pre-resolved call-site parameter-name inlay hints (position + label).
     hints: Vec<(Position, String)>,
+    /// Delta-encoded semantic tokens for the whole file.
+    tokens: Vec<SemanticToken>,
 }
 
 struct Span {
@@ -123,6 +126,9 @@ impl Index {
         let mut containers: HashMap<String, Vec<Member>> = HashMap::new();
         let mut callables: HashMap<String, Vec<i64>> = HashMap::new();
         let mut pending: Vec<PendingHint> = Vec::new();
+        // Declaration ids that are function/event/error/modifier parameters, so
+        // their tokens (and references) color as parameters, not variables.
+        let mut param_ids: HashSet<i64> = HashSet::new();
 
         for s in sources {
             let Ok(text) = std::fs::read_to_string(&s.path) else {
@@ -156,6 +162,7 @@ impl Index {
                                 | "ModifierDefinition"
                         ) {
                             callables.entry(name.to_string()).or_default().push(id);
+                            collect_param_ids(map, &mut param_ids);
                         }
                         decls.entry(id).or_insert_with(|| Decl {
                             src_index: s.index,
@@ -197,7 +204,18 @@ impl Index {
             });
 
             collect_containers(&s.ast, &mut containers);
-            files.insert(s.index, FileEntry { uri, text, spans, symbols, hints: Vec::new() });
+            files.insert(
+                s.index,
+                FileEntry { uri, text, spans, symbols, hints: Vec::new(), tokens: Vec::new() },
+            );
+        }
+
+        // Color every clickable span by what it resolves to (declarations and
+        // references alike). Needs the full `decls` map, so it runs after the
+        // per-file loop.
+        for f in files.values_mut() {
+            let mapper = PositionMapper::new(&f.text);
+            f.tokens = encode_tokens(&f.spans, &decls, &param_ids, &mapper);
         }
 
         // Resolve queued call-site hints now that every declaration is known
@@ -238,6 +256,14 @@ impl Index {
                 data: None,
             })
             .collect()
+    }
+
+    /// Whole-file semantic tokens (delta-encoded), matching `token_legend`.
+    pub fn semantic_tokens(&self, path: &Path) -> Vec<SemanticToken> {
+        self.slot_for(path)
+            .and_then(|i| self.files.get(&i))
+            .map(|f| f.tokens.clone())
+            .unwrap_or_default()
     }
 
     pub fn definition(&self, path: &Path, pos: Position) -> Option<Location> {
@@ -631,6 +657,105 @@ fn param_hint(param_names: &[String], arg_index: usize, arg_ident: Option<&str>)
         return None;
     }
     Some(format!("{name}:"))
+}
+
+/// The semantic-token legend, in the order `token_index` encodes. The server
+/// advertises this in its capabilities so the editor can decode the tokens.
+pub fn token_legend() -> Vec<SemanticTokenType> {
+    vec![
+        SemanticTokenType::CLASS,       // 0: contracts / libraries / interfaces
+        SemanticTokenType::STRUCT,      // 1
+        SemanticTokenType::ENUM,        // 2
+        SemanticTokenType::ENUM_MEMBER, // 3
+        SemanticTokenType::EVENT,       // 4
+        SemanticTokenType::FUNCTION,    // 5: functions / modifiers
+        SemanticTokenType::TYPE,        // 6: errors / user-defined value types
+        SemanticTokenType::PARAMETER,   // 7
+        SemanticTokenType::VARIABLE,    // 8: state variables / locals
+    ]
+}
+
+/// Legend index for a declaration kind, or `None` for kinds we do not color.
+fn token_index(kind: &str, is_param: bool) -> Option<u32> {
+    Some(match kind {
+        "ContractDefinition" => 0,
+        "StructDefinition" => 1,
+        "EnumDefinition" => 2,
+        "EnumValue" => 3,
+        "EventDefinition" => 4,
+        "FunctionDefinition" | "ModifierDefinition" => 5,
+        "ErrorDefinition" | "UserDefinedValueTypeDefinition" => 6,
+        "VariableDeclaration" if is_param => 7,
+        "VariableDeclaration" => 8,
+        _ => return None,
+    })
+}
+
+/// Record the declaration ids of a callable's parameters (and named returns).
+fn collect_param_ids(map: &Map<String, Value>, out: &mut HashSet<i64>) {
+    for key in ["parameters", "returnParameters"] {
+        if let Some(list) = map.get(key).and_then(|p| p.get("parameters")).and_then(|a| a.as_array())
+        {
+            for p in list {
+                if let Some(id) = p.get("id").and_then(|v| v.as_i64()) {
+                    out.insert(id);
+                }
+            }
+        }
+    }
+}
+
+/// Delta-encode the file's spans into LSP semantic tokens, coloring each by the
+/// kind of the declaration it resolves to. Spans are single-line identifiers;
+/// overlapping/duplicate spans are dropped so tokens stay strictly increasing.
+fn encode_tokens(
+    spans: &[Span],
+    decls: &HashMap<i64, Decl>,
+    param_ids: &HashSet<i64>,
+    mapper: &PositionMapper,
+) -> Vec<SemanticToken> {
+    let mut toks: Vec<(u32, u32, u32, u32)> = Vec::new();
+    for s in spans {
+        let Some(d) = decls.get(&s.decl) else {
+            continue;
+        };
+        let Some(ty) = token_index(&d.kind, param_ids.contains(&s.decl)) else {
+            continue;
+        };
+        let start = mapper.position(s.start);
+        let end = mapper.position(s.end);
+        if start.line != end.line {
+            continue;
+        }
+        let len = end.character.saturating_sub(start.character);
+        if len > 0 {
+            toks.push((start.line, start.character, len, ty));
+        }
+    }
+    toks.sort_unstable_by_key(|t| (t.0, t.1));
+
+    let mut data = Vec::new();
+    let (mut prev_line, mut prev_char) = (0u32, 0u32);
+    let mut last_end: Option<(u32, u32)> = None;
+    for (line, ch, len, ty) in toks {
+        if let Some((ll, le)) = last_end {
+            if line == ll && ch < le {
+                continue; // overlaps the previous token
+            }
+        }
+        let delta_line = line - prev_line;
+        let delta_start = if delta_line == 0 { ch - prev_char } else { ch };
+        data.push(SemanticToken {
+            delta_line,
+            delta_start,
+            length: len,
+            token_type: ty,
+            token_modifiers_bitset: 0,
+        });
+        (prev_line, prev_char) = (line, ch);
+        last_end = Some((line, ch + len));
+    }
+    data
 }
 
 /// Record the members of each container (contract/library/struct/enum) by name.

@@ -301,6 +301,17 @@ impl LanguageServer for Backend {
                 }),
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 inlay_hint_provider: Some(OneOf::Left(true)),
+                semantic_tokens_provider: Some(
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
+                        legend: SemanticTokensLegend {
+                            token_types: index::token_legend(),
+                            token_modifiers: vec![],
+                        },
+                        full: Some(SemanticTokensFullOptions::Bool(true)),
+                        range: Some(false),
+                        work_done_progress_options: Default::default(),
+                    }),
+                ),
                 ..Default::default()
             },
         })
@@ -457,6 +468,22 @@ impl LanguageServer for Backend {
             })
             .collect();
         Ok((!actions.is_empty()).then_some(actions))
+    }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> Result<Option<SemanticTokensResult>> {
+        let Ok(path) = params.text_document.uri.to_file_path() else {
+            return Ok(None);
+        };
+        let guard = self.state.index.read().await;
+        let Some(idx) = guard.as_ref() else {
+            return Ok(None);
+        };
+        let data = idx.semantic_tokens(&path);
+        Ok((!data.is_empty())
+            .then_some(SemanticTokensResult::Tokens(SemanticTokens { result_id: None, data })))
     }
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
