@@ -439,33 +439,68 @@ impl LanguageServer for Backend {
     ) -> Result<Option<CodeActionResponse>> {
         let uri = params.text_document.uri;
         let req = params.range;
-        let fixes = self.state.fixes.lock().await;
-        let Some(file_fixes) = fixes.get(&uri) else {
-            return Ok(None);
-        };
-        let actions: Vec<CodeActionOrCommand> = file_fixes
-            .iter()
-            .filter(|f| ranges_overlap(f.range, req))
-            .map(|f| {
-                let mut changes = HashMap::new();
-                changes.insert(
-                    uri.clone(),
-                    vec![TextEdit {
-                        range: f.range,
-                        new_text: f.new_text.clone(),
-                    }],
-                );
-                CodeActionOrCommand::CodeAction(CodeAction {
-                    title: f.title.clone(),
-                    kind: Some(CodeActionKind::QUICKFIX),
-                    edit: Some(WorkspaceEdit {
-                        changes: Some(changes),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                })
-            })
-            .collect();
+        let mut actions: Vec<CodeActionOrCommand> = Vec::new();
+
+        // `forge lint` suggested replacements (from the last compile).
+        if let Some(file_fixes) = self.state.fixes.lock().await.get(&uri) {
+            for f in file_fixes.iter().filter(|f| ranges_overlap(f.range, req)) {
+                actions.push(quickfix(&uri, f.range, f.new_text.clone(), f.title.clone()));
+            }
+        }
+
+        // The rest need the current buffer text.
+        let text = self.state.docs.read().await.get(&uri).cloned();
+        if let Some(text) = text {
+            // Missing SPDX is suppressed in diagnostics to match `forge build`,
+            // so offer the fix from the buffer when editing near the top.
+            if req.start.line <= 2 && !text.contains("SPDX-License-Identifier") {
+                let top = Range::new(Position::new(0, 0), Position::new(0, 0));
+                actions.push(quickfix(
+                    &uri,
+                    top,
+                    "// SPDX-License-Identifier: MIT\n".to_string(),
+                    "Add SPDX license identifier".to_string(),
+                ));
+            }
+
+            for d in &params.context.diagnostics {
+                // Missing pragma: solc names the exact pragma to add.
+                if diag_code_is(d, 3420) {
+                    if let Some(pragma) = pragma_from_message(&d.message) {
+                        let at = Position::new(spdx_line(&text).map_or(0, |l| l + 1), 0);
+                        actions.push(quickfix(
+                            &uri,
+                            Range::new(at, at),
+                            format!("{pragma}\n"),
+                            format!("Add `{pragma}`"),
+                        ));
+                    }
+                }
+                // Undeclared identifier: suggest importing it from where it lives.
+                if diag_code_is(d, 7576) {
+                    let name = slice(&text, d.range);
+                    if !name.is_empty() && name.bytes().all(is_ident_byte) {
+                        let from = uri.to_file_path().ok();
+                        let guard = self.state.index.read().await;
+                        if let (Some(idx), Some(from)) = (guard.as_ref(), from) {
+                            let at = Position::new(import_line(&text), 0);
+                            for cand in idx.import_candidates(&name) {
+                                let Some(rel) = relative_import(&from, &cand) else {
+                                    continue;
+                                };
+                                actions.push(quickfix(
+                                    &uri,
+                                    Range::new(at, at),
+                                    format!("import {{{name}}} from \"{rel}\";\n"),
+                                    format!("Import `{name}` from \"{rel}\""),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Ok((!actions.is_empty()).then_some(actions))
     }
 
@@ -569,6 +604,80 @@ fn ranges_overlap(a: Range, b: Range) -> bool {
     a.start <= b.end && b.start <= a.end
 }
 
+/// Build a single-edit quick-fix code action.
+fn quickfix(uri: &Url, range: Range, new_text: String, title: String) -> CodeActionOrCommand {
+    let mut changes = HashMap::new();
+    changes.insert(uri.clone(), vec![TextEdit { range, new_text }]);
+    CodeActionOrCommand::CodeAction(CodeAction {
+        title,
+        kind: Some(CodeActionKind::QUICKFIX),
+        edit: Some(WorkspaceEdit { changes: Some(changes), ..Default::default() }),
+        ..Default::default()
+    })
+}
+
+/// Whether a diagnostic carries the given numeric solc error code.
+fn diag_code_is(d: &Diagnostic, code: i32) -> bool {
+    matches!(&d.code, Some(NumberOrString::Number(n)) if *n == code)
+}
+
+/// Pull the suggested pragma out of solc's "does not specify required compiler
+/// version" message, which names it verbatim in quotes.
+fn pragma_from_message(msg: &str) -> Option<String> {
+    let start = msg.find('"')? + 1;
+    let end = msg[start..].find('"')? + start;
+    let candidate = msg[start..end].trim();
+    candidate.starts_with("pragma").then(|| candidate.to_string())
+}
+
+/// 0-based line of the SPDX identifier, if the file has one.
+fn spdx_line(text: &str) -> Option<u32> {
+    text.lines().position(|l| l.contains("SPDX-License-Identifier")).map(|i| i as u32)
+}
+
+/// Line to insert a new import on: after the last import/pragma, else after the
+/// SPDX line, else the top of the file.
+fn import_line(text: &str) -> u32 {
+    let mut after = spdx_line(text).map_or(0, |l| l + 1);
+    for (i, line) in text.lines().enumerate() {
+        let t = line.trim_start();
+        if t.starts_with("import") || t.starts_with("pragma") {
+            after = i as u32 + 1;
+        }
+    }
+    after
+}
+
+/// The document text covered by an LSP range.
+fn slice(text: &str, range: Range) -> String {
+    let m = diagnostics::PositionMapper::new(text);
+    let (s, e) = (m.offset(range.start), m.offset(range.end));
+    text.get(s..e).unwrap_or("").to_string()
+}
+
+/// A relative Solidity import path from one file to another (`./B.sol`,
+/// `../lib/C.sol`), which resolves the same regardless of remappings.
+fn relative_import(from_file: &std::path::Path, to_file: &std::path::Path) -> Option<String> {
+    let from: Vec<_> = from_file.parent()?.components().collect();
+    let to: Vec<_> = to_file.components().collect();
+    let mut i = 0;
+    while i < from.len() && i < to.len() && from[i] == to[i] {
+        i += 1;
+    }
+    let mut s = String::new();
+    match from.len() - i {
+        0 => s.push_str("./"),
+        ups => (0..ups).for_each(|_| s.push_str("../")),
+    }
+    let rest: Vec<String> =
+        to[i..].iter().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+    if rest.is_empty() {
+        return None;
+    }
+    s.push_str(&rest.join("/"));
+    Some(s)
+}
+
 fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
 }
@@ -627,7 +736,34 @@ fn call_context(text: &str, offset: usize) -> Option<(String, u32)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{call_context, member_context};
+    use super::{call_context, import_line, member_context, pragma_from_message, relative_import};
+    use std::path::Path;
+
+    #[test]
+    fn pragma_extracted_from_solc_message() {
+        let msg = "Source file does not specify required compiler version! \
+                   Consider adding \"pragma solidity ^0.8.35;\"";
+        assert_eq!(pragma_from_message(msg), Some("pragma solidity ^0.8.35;".into()));
+        assert_eq!(pragma_from_message("no suggestion here"), None);
+    }
+
+    #[test]
+    fn relative_import_paths() {
+        let a = Path::new("/p/src/A.sol");
+        assert_eq!(relative_import(a, Path::new("/p/src/B.sol")), Some("./B.sol".into()));
+        assert_eq!(relative_import(a, Path::new("/p/src/lib/C.sol")), Some("./lib/C.sol".into()));
+        assert_eq!(
+            relative_import(Path::new("/p/src/sub/A.sol"), Path::new("/p/src/B.sol")),
+            Some("../B.sol".into())
+        );
+    }
+
+    #[test]
+    fn import_inserts_after_header() {
+        assert_eq!(import_line("// SPDX-License-Identifier: MIT\npragma solidity 0.8.35;\n\nx"), 2);
+        assert_eq!(import_line("pragma solidity 0.8.35;\nimport \"a.sol\";\ncode"), 2);
+        assert_eq!(import_line("contract C {}"), 0);
+    }
 
     #[test]
     fn member_contexts() {

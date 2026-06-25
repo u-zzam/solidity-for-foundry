@@ -115,6 +115,9 @@ pub struct Index {
     containers: HashMap<String, Vec<Member>>,
     /// Callable name -> declaration ids, for signature help (overloads included).
     callables: HashMap<String, Vec<i64>>,
+    /// Declaration ids that are top-level (direct children of a source unit),
+    /// i.e. importable by name. Used to suggest imports for unresolved symbols.
+    top_level: HashSet<i64>,
 }
 
 impl Index {
@@ -129,6 +132,7 @@ impl Index {
         // Declaration ids that are function/event/error/modifier parameters, so
         // their tokens (and references) color as parameters, not variables.
         let mut param_ids: HashSet<i64> = HashSet::new();
+        let mut top_level: HashSet<i64> = HashSet::new();
 
         for s in sources {
             let Ok(text) = std::fs::read_to_string(&s.path) else {
@@ -204,6 +208,19 @@ impl Index {
             });
 
             collect_containers(&s.ast, &mut containers);
+            // Top-level (source-unit) declarations are the ones importable by name.
+            if let Some(nodes) = s.ast.get("nodes").and_then(|n| n.as_array()) {
+                for n in nodes {
+                    if let (Some(id), Some(name)) = (
+                        n.get("id").and_then(|v| v.as_i64()),
+                        n.get("name").and_then(|v| v.as_str()),
+                    ) {
+                        if !name.is_empty() {
+                            top_level.insert(id);
+                        }
+                    }
+                }
+            }
             files.insert(
                 s.index,
                 FileEntry { uri, text, spans, symbols, hints: Vec::new(), tokens: Vec::new() },
@@ -234,7 +251,23 @@ impl Index {
             }
         }
 
-        Self { files, path_to_index, decls, refs_by_decl, containers, callables }
+        Self { files, path_to_index, decls, refs_by_decl, containers, callables, top_level }
+    }
+
+    /// Files declaring a top-level symbol named `name`, for import suggestions.
+    pub fn import_candidates(&self, name: &str) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = Vec::new();
+        for (id, d) in &self.decls {
+            if d.name == name && self.top_level.contains(id) {
+                if let Some(p) = self.files.get(&d.src_index).and_then(|f| f.uri.to_file_path().ok())
+                {
+                    if !out.contains(&p) {
+                        out.push(p);
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Call-site parameter-name inlay hints within `range`.
