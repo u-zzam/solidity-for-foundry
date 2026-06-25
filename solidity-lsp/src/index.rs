@@ -101,6 +101,10 @@ struct PendingHint {
     /// The callee declaration the call resolved to.
     callee: i64,
     arg_index: usize,
+    /// Number of written arguments at the call site. For a `using for` bound
+    /// call (`x.f(a)`) the callee's parameter list includes the receiver, so it
+    /// has one more entry than this; the resolver shifts the index to match.
+    arg_count: usize,
     /// If the argument is a bare identifier, its name — used to drop hints that
     /// would just echo the argument (`transfer(to, amount)`).
     arg_ident: Option<String>,
@@ -241,7 +245,12 @@ impl Index {
             let Some(decl) = decls.get(&h.callee) else {
                 continue;
             };
-            let Some(label) = param_hint(&decl.param_names, h.arg_index, h.arg_ident.as_deref())
+            // `using for` calls inject the receiver as the first parameter, so
+            // the parameter list is one longer than the written arguments; the
+            // offset realigns argument N with its real parameter.
+            let offset = decl.param_names.len().saturating_sub(h.arg_count);
+            let Some(label) =
+                param_hint(&decl.param_names, h.arg_index + offset, h.arg_ident.as_deref())
             else {
                 continue;
             };
@@ -670,6 +679,7 @@ fn collect_call_hints(map: &Map<String, Value>, src_index: usize, out: &mut Vec<
     let Some(args) = map.get("arguments").and_then(|a| a.as_array()) else {
         return;
     };
+    let arg_count = args.len();
     for (i, arg) in args.iter().enumerate() {
         let Some((byte, _)) = arg.get("src").and_then(|s| s.as_str()).and_then(parse_src) else {
             continue;
@@ -677,7 +687,7 @@ fn collect_call_hints(map: &Map<String, Value>, src_index: usize, out: &mut Vec<
         let arg_ident = (arg.get("nodeType").and_then(|t| t.as_str()) == Some("Identifier"))
             .then(|| arg.get("name").and_then(|v| v.as_str()).map(String::from))
             .flatten();
-        out.push(PendingHint { src_index, byte, callee, arg_index: i, arg_ident });
+        out.push(PendingHint { src_index, byte, callee, arg_index: i, arg_count, arg_ident });
     }
 }
 
