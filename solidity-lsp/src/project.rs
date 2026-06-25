@@ -465,3 +465,68 @@ pub fn check_buffer(root: &Path, target: &Path, buffer: &str) -> Result<Vec<Solc
     let output = solc.compile(&input).map_err(|e| e.to_string())?;
     Ok(filter_errors(output.errors, root, &cfg))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+
+    fn temp_dir() -> PathBuf {
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("solidity-lsp-test-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn locates_nearest_foundry_root() {
+        // A monorepo: an outer root and a nested package, each with foundry.toml.
+        let root = temp_dir();
+        let pkg = root.join("pkg");
+        std::fs::create_dir_all(pkg.join("src")).unwrap();
+        std::fs::write(root.join("foundry.toml"), "[profile.default]\n").unwrap();
+        std::fs::write(pkg.join("foundry.toml"), "[profile.default]\n").unwrap();
+
+        let nested = pkg.join("src").join("A.sol");
+        std::fs::write(&nested, "contract A {}").unwrap();
+        assert_eq!(locate_root(&nested).as_deref(), Some(pkg.as_path()));
+
+        let outer = root.join("X.sol");
+        std::fs::write(&outer, "contract X {}").unwrap();
+        assert_eq!(locate_root(&outer).as_deref(), Some(root.as_path()));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn parses_pinned_solc_version() {
+        let root = temp_dir();
+        std::fs::write(root.join("foundry.toml"), "[profile.default]\nsolc = \"0.8.19\"\n").unwrap();
+        assert_eq!(parse_config(&root).solc, Some(Version::new(0, 8, 19)));
+
+        // The `solc_version` alias and a leading caret both pin the same version.
+        std::fs::write(root.join("foundry.toml"), "[profile.default]\nsolc_version = \"^0.8.19\"\n")
+            .unwrap();
+        assert_eq!(parse_config(&root).solc, Some(Version::new(0, 8, 19)));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolves_unusual_remapping_prefixes() {
+        let root = temp_dir();
+        std::fs::write(root.join("foundry.toml"), "[profile.default]\n").unwrap();
+        std::fs::write(root.join("remappings.txt"), "@odd-prefix.v2/=node_modules/@odd/v2/\n#c\n\n")
+            .unwrap();
+        let cfg = parse_config(&root);
+        let remappings = resolve_remappings(&root, &cfg);
+        assert!(
+            remappings.iter().any(|r| r.name == "@odd-prefix.v2/"),
+            "unusual prefix not resolved: {:?}",
+            remappings.iter().map(|r| r.name.clone()).collect::<Vec<_>>()
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+}
