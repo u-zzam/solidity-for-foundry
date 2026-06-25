@@ -1,3 +1,6 @@
 [workspace]
 members = ["solidity-lsp"]
+# The Zed client is a wasm cdylib with its own toolchain target; keep it out of
+# the native workspace build.
+exclude = ["solidity-zed"]
 resolver = "2"
