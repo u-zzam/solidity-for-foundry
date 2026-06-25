@@ -12,3 +12,7 @@ solidity-vscode/out/
 
 # Zed client build
 solidity-zed/target/
+
+# Zed-downloaded grammar sources (fetched on extension install)
+solidity-zed/grammars/
+solidity-zed/extension.wasm
