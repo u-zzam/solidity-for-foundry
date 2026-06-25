@@ -150,11 +150,13 @@ pub fn for_buffer(errors: &[SolcError], root: &Path, target: &Url, buffer: &str)
     let mapper = PositionMapper::new(buffer);
     errors
         .iter()
-        .filter(|err| {
-            err.source_location
-                .as_ref()
-                .and_then(|loc| Url::from_file_path(root.join(&loc.file)).ok())
-                .is_some_and(|uri| uri == *target)
+        .filter(|err| match &err.source_location {
+            // Errors with no location (e.g. a fatal compiler run failure) attach
+            // to the edited file at the top, rather than vanishing.
+            None => true,
+            Some(loc) => {
+                Url::from_file_path(root.join(&loc.file)).ok().is_some_and(|uri| uri == *target)
+            }
         })
         .map(|err| to_diagnostic(err, &mapper))
         .collect()

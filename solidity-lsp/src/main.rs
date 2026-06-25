@@ -103,15 +103,37 @@ impl Backend {
                 .publish_diagnostics(uri.clone(), diags.clone(), None)
                 .await;
         }
-        // Clear files that had diagnostics last time but are clean now.
+        // Clear files that had diagnostics last time but are clean now — except
+        // files with unsaved edits, whose squiggles are owned by the live buffer
+        // check (this on-disk compile would otherwise wipe them until the next
+        // keystroke).
+        let mut next: HashSet<Url> = new.keys().cloned().collect();
         for uri in published.iter() {
-            if !new.contains_key(uri) {
-                self.client
-                    .publish_diagnostics(uri.clone(), Vec::new(), None)
-                    .await;
+            if new.contains_key(uri) {
+                continue;
             }
+            if self.is_dirty(uri).await {
+                next.insert(uri.clone());
+                continue;
+            }
+            self.client
+                .publish_diagnostics(uri.clone(), Vec::new(), None)
+                .await;
         }
-        *published = new.into_keys().collect();
+        *published = next;
+    }
+
+    /// Whether `uri` has an open buffer that differs from its on-disk content
+    /// (so the live check, not an on-disk compile, owns its diagnostics).
+    async fn is_dirty(&self, uri: &Url) -> bool {
+        let Some(buffer) = self.state.docs.read().await.get(uri).cloned() else {
+            return false;
+        };
+        let Ok(path) = uri.to_file_path() else {
+            return false;
+        };
+        // A buffer with no readable file on disk is unsaved -> live owns it.
+        std::fs::read_to_string(&path).map_or(true, |disk| disk != buffer)
     }
 
     /// Rebuild the navigation index from a full compile of the owning project.
