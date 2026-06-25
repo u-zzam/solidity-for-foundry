@@ -20,9 +20,56 @@ This is one shared server that fixes all three: identical everywhere, current so
 - **Code intelligence** (go-to-def, hover, completion) is powered by the **typed solc AST** plus **solar** for fast, error-tolerant live parsing.
 - One Rust server; thin clients for VS Code and Zed; a one-line config for Neovim/Helix/Emacs.
 
-## Editors
+## Install
 
-VS Code · Zed · Neovim · Helix · Emacs (any LSP client).
+Build and install the server binary (requires Rust and `forge` on your `PATH`):
+
+```sh
+cargo install --path solidity-lsp
+```
+
+This puts `solidity-lsp` on your `PATH`. It auto-downloads the solc version your
+project pins (via svm) on first compile.
+
+## Editor setup
+
+Every editor runs the *same* `solidity-lsp` binary, so behavior is identical.
+
+**VS Code** — install the [`solidity-vscode`](./solidity-vscode) extension
+(press F5 from that folder for a dev host). It spawns `solidity-lsp` automatically.
+
+**Zed** — install [`solidity-zed`](./solidity-zed) as a dev extension
+(`zed: install dev extension`).
+
+**Neovim** (0.11+):
+
+```lua
+vim.filetype.add({ extension = { sol = "solidity" } })
+vim.lsp.config("solidity_foundry", {
+  cmd = { "solidity-lsp" },
+  filetypes = { "solidity" },
+  root_markers = { "foundry.toml" },
+})
+vim.lsp.enable("solidity_foundry")
+```
+
+**Helix** (`languages.toml`):
+
+```toml
+[language-server.solidity-lsp]
+command = "solidity-lsp"
+
+[[language]]
+name = "solidity"
+language-servers = ["solidity-lsp"]
+```
+
+**Emacs** (eglot):
+
+```elisp
+(with-eval-after-load 'eglot
+  (add-to-list 'eglot-server-programs '(solidity-mode . ("solidity-lsp"))))
+```
 
 ## Roadmap
 
