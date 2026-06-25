@@ -126,6 +126,9 @@ impl Backend {
             return;
         };
 
+        // Show "Indexing…" in the editor so navigation-not-ready reads as
+        // in-progress, not broken, during the full compile.
+        let token = self.progress_begin("Indexing Solidity project").await;
         let r = root.clone();
         let built = tokio::task::spawn_blocking(move || {
             project::compile(&r, true).map(|out| {
@@ -136,6 +139,7 @@ impl Backend {
             })
         })
         .await;
+        self.progress_end(token).await;
         match built {
             Ok(Ok(Some(idx))) => {
                 *self.state.index.write().await = Some(idx);
@@ -162,6 +166,42 @@ impl Backend {
                     .await;
             }
         }
+    }
+
+    /// Begin a work-done progress (shown in the editor's status bar).
+    async fn progress_begin(&self, title: &str) -> ProgressToken {
+        let token = ProgressToken::String("solidity/indexing".to_string());
+        let _ = self
+            .client
+            .send_request::<request::WorkDoneProgressCreate>(WorkDoneProgressCreateParams {
+                token: token.clone(),
+            })
+            .await;
+        self.client
+            .send_notification::<notification::Progress>(ProgressParams {
+                token: token.clone(),
+                value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
+                    WorkDoneProgressBegin {
+                        title: title.to_string(),
+                        cancellable: Some(false),
+                        message: None,
+                        percentage: None,
+                    },
+                )),
+            })
+            .await;
+        token
+    }
+
+    async fn progress_end(&self, token: ProgressToken) {
+        self.client
+            .send_notification::<notification::Progress>(ProgressParams {
+                token,
+                value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(WorkDoneProgressEnd {
+                    message: None,
+                })),
+            })
+            .await;
     }
 
     /// Run work off the message loop so the server stays responsive.
