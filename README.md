@@ -84,6 +84,15 @@ language-servers = ["solidity-for-foundry-lsp"]
   (add-to-list 'eglot-server-programs '(solidity-mode . ("solidity-for-foundry-lsp"))))
 ```
 
+## Conflicts with other Solidity extensions
+
+An editor binds each `.sol` file to a single language server, so run only one
+Solidity extension at a time. If you have **Solidity by Juan Blanco** or
+**Solidity by Nomic Foundation** installed, disable it (in VS Code: Extensions →
+the extension → *Disable*, or *Disable (Workspace)* to keep it elsewhere) and
+reload — otherwise you get doubled diagnostics and hovers, and the syntax
+grammar (`source.solidity`, which both also register) is non-deterministic.
+
 ## Features
 
 Implemented:

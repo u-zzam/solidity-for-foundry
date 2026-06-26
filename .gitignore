@@ -10,6 +10,9 @@ node_modules/
 solidity-vscode/out/
 *.vsix
 
+# Local distribution bundle (prebuilt binary + vsix, shared by hand)
+/dist-local/
+
 # Zed client build
 solidity-zed/target/
 
