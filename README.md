@@ -1,6 +1,6 @@
 # Solidity for Foundry
 
-A **Foundry-native Solidity language server** — the same behavior in every editor, always on your project's exact solc version, with imports resolved exactly like `forge build`.
+The Solidity language server for the modern, **Foundry-native** development stack — identical in every editor, always on your project's exact solc version, with imports resolved exactly like `forge build`.
 
 > Status: working. Navigation is live as you type; diagnostics and richer
 > intelligence (inlay hints, semantic tokens, code actions) run on your

@@ -3,7 +3,7 @@ name = "Solidity for Foundry"
 version = "0.1.0"
 schema_version = 1
 authors = ["solidity contributors"]
-description = "Foundry-native Solidity language server: diagnostics, formatting and navigation on your project's exact solc version."
+description = "The Solidity language server for the modern, Foundry-native stack: diagnostics, formatting, and navigation on your project's exact solc version."
 repository = "https://github.com/u-zzam/solidity-for-foundry"
 
 [language_servers.solidity-for-foundry-lsp]
