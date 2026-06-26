@@ -31,7 +31,9 @@ jobs:
         include:
           - os: macos-14
             target: aarch64-apple-darwin
-          - os: macos-13
+          # GitHub is retiring Intel (macos-13) runners, so cross-compile the
+          # x86_64 macOS binary on the Apple-Silicon runner instead.
+          - os: macos-14
             target: x86_64-apple-darwin
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
