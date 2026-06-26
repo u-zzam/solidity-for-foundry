@@ -1,0 +1,199 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Solidity",
+  "scopeName": "source.solidity",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#pragma" },
+    { "include": "#import" },
+    { "include": "#definitions" },
+    { "include": "#keywords" },
+    { "include": "#types" },
+    { "include": "#globals" },
+    { "include": "#constants" },
+    { "include": "#numbers" },
+    { "include": "#strings" },
+    { "include": "#operators" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.block.documentation.solidity",
+          "begin": "/\\*\\*",
+          "end": "\\*/"
+        },
+        {
+          "name": "comment.block.solidity",
+          "begin": "/\\*",
+          "end": "\\*/"
+        },
+        {
+          "name": "comment.line.documentation.solidity",
+          "match": "///.*$"
+        },
+        {
+          "name": "comment.line.double-slash.solidity",
+          "match": "//.*$"
+        }
+      ]
+    },
+    "pragma": {
+      "begin": "\\b(pragma)\\b",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.pragma.solidity" }
+      },
+      "end": ";",
+      "endCaptures": {
+        "0": { "name": "punctuation.terminator.statement.solidity" }
+      },
+      "patterns": [
+        { "include": "#strings" },
+        { "include": "#numbers" },
+        {
+          "name": "keyword.other.solidity",
+          "match": "\\b(solidity|abicoder|experimental)\\b"
+        },
+        {
+          "name": "constant.other.version.solidity",
+          "match": "[\\^~><=]*\\s*[0-9]+\\.[0-9]+\\.[0-9]+"
+        },
+        {
+          "name": "entity.name.tag.solidity",
+          "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b"
+        }
+      ]
+    },
+    "import": {
+      "begin": "\\b(import)\\b",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.import.solidity" }
+      },
+      "end": ";",
+      "endCaptures": {
+        "0": { "name": "punctuation.terminator.statement.solidity" }
+      },
+      "patterns": [
+        { "include": "#strings" },
+        {
+          "name": "keyword.control.import.solidity",
+          "match": "\\b(from|as)\\b"
+        },
+        {
+          "name": "variable.other.solidity",
+          "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b"
+        }
+      ]
+    },
+    "definitions": {
+      "patterns": [
+        {
+          "match": "\\b(contract|interface|library|struct|enum|event|error)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "keyword.other.declaration.solidity" },
+            "2": { "name": "entity.name.type.solidity" }
+          }
+        },
+        {
+          "match": "\\b(function|modifier)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "keyword.other.declaration.solidity" },
+            "2": { "name": "entity.name.function.solidity" }
+          }
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.solidity",
+          "match": "\\b(if|else|for|while|do|return|break|continue|try|catch|throw|emit|revert|unchecked|assembly)\\b"
+        },
+        {
+          "name": "keyword.other.declaration.solidity",
+          "match": "\\b(contract|interface|library|function|modifier|event|error|struct|enum|mapping|constructor|fallback|receive|using|is|new|delete|type)\\b"
+        },
+        {
+          "name": "storage.modifier.solidity",
+          "match": "\\b(public|private|internal|external|pure|view|payable|constant|immutable|memory|storage|calldata|virtual|override|returns|anonymous|indexed)\\b"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "support.type.solidity",
+          "match": "\\b(address|bool|string|bytes32|bytes31|bytes30|bytes29|bytes28|bytes27|bytes26|bytes25|bytes24|bytes23|bytes22|bytes21|bytes20|bytes19|bytes18|bytes17|bytes16|bytes15|bytes14|bytes13|bytes12|bytes11|bytes10|bytes9|bytes8|bytes7|bytes6|bytes5|bytes4|bytes3|bytes2|bytes1|bytes|byte)\\b"
+        },
+        {
+          "name": "support.type.solidity",
+          "match": "\\b(uint|int)(256|248|240|232|224|216|208|200|192|184|176|168|160|152|144|136|128|120|112|104|96|88|80|72|64|56|48|40|32|24|16|8)?\\b"
+        },
+        {
+          "name": "support.type.solidity",
+          "match": "\\b(fixed|ufixed)([0-9]+x[0-9]+)?\\b"
+        }
+      ]
+    },
+    "globals": {
+      "patterns": [
+        {
+          "name": "variable.language.solidity",
+          "match": "\\b(msg|block|tx|abi|this|super)\\b"
+        },
+        {
+          "name": "support.function.solidity",
+          "match": "\\b(require|assert|revert|keccak256|sha256|sha3|ripemd160|ecrecover|addmod|mulmod|selfdestruct|blockhash|gasleft|type)\\b"
+        }
+      ]
+    },
+    "constants": {
+      "name": "constant.language.solidity",
+      "match": "\\b(true|false)\\b"
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.hex.solidity",
+          "match": "\\b0[xX][0-9a-fA-F][0-9a-fA-F_]*\\b"
+        },
+        {
+          "name": "constant.numeric.decimal.solidity",
+          "match": "\\b[0-9][0-9_]*(\\.[0-9_]+)?([eE][-+]?[0-9_]+)?\\s*(ether|gwei|wei|finney|szabo|seconds|minutes|hours|days|weeks|years)?\\b"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.solidity",
+          "begin": "(?:hex|unicode)?\"",
+          "end": "\"",
+          "patterns": [{ "include": "#string-escape" }]
+        },
+        {
+          "name": "string.quoted.single.solidity",
+          "begin": "(?:hex|unicode)?'",
+          "end": "'",
+          "patterns": [{ "include": "#string-escape" }]
+        }
+      ]
+    },
+    "string-escape": {
+      "name": "constant.character.escape.solidity",
+      "match": "\\\\(x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|.)"
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.solidity",
+          "match": "(=>|->|\\+\\+|--|&&|\\|\\||<<|>>|==|!=|<=|>=|[-+*/%&|^~!<>=?]=?|:)"
+        },
+        {
+          "name": "punctuation.solidity",
+          "match": "[;,.(){}\\[\\]]"
+        }
+      ]
+    }
+  }
+}
