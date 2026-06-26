@@ -1,11 +1,11 @@
-# Solidity (Foundry) — Zed
+# Solidity for Foundry — Zed
 
-Thin Zed client for [`solidity-lsp`](../solidity-lsp). Registers the Solidity
-language and runs the shared server, so behavior matches every other editor.
+Thin Zed client for [`solidity-for-foundry-lsp`](../solidity-lsp). Registers the
+Solidity language and runs the shared server, so behavior matches every other editor.
 
 ## Requirements
 
-The `solidity-lsp` binary on your `PATH`:
+The `solidity-for-foundry-lsp` binary on your `PATH`:
 
 ```sh
 cargo install --path ../solidity-lsp --locked

@@ -49,14 +49,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          asset="solidity-lsp-${{ matrix.target }}"
-          cp "target/${{ matrix.target }}/release/solidity-lsp" "$asset"
+          asset="solidity-for-foundry-lsp-${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release/solidity-for-foundry-lsp" "$asset"
           gh release upload "${{ github.ref_name }}" "$asset" --repo "${{ github.repository }}" --clobber
       - name: Package and upload (windows)
         if: runner.os == 'Windows'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $asset = "solidity-lsp-${{ matrix.target }}.exe"
-          Copy-Item "target/${{ matrix.target }}/release/solidity-lsp.exe" $asset
+          $asset = "solidity-for-foundry-lsp-${{ matrix.target }}.exe"
+          Copy-Item "target/${{ matrix.target }}/release/solidity-for-foundry-lsp.exe" $asset
           gh release upload "${{ github.ref_name }}" $asset --repo "${{ github.repository }}" --clobber

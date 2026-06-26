@@ -11,7 +11,7 @@ impl SolidityExtension {
     /// don't need a Rust toolchain. Editors share the same server, so behavior
     /// matches across all of them.
     fn server_path(&mut self, id: &LanguageServerId, worktree: &Worktree) -> Result<String> {
-        if let Some(path) = worktree.which("solidity-lsp") {
+        if let Some(path) = worktree.which("solidity-for-foundry-lsp") {
             return Ok(path);
         }
         if let Some(path) = &self.cached {
@@ -25,7 +25,7 @@ impl SolidityExtension {
             &zed::LanguageServerInstallationStatus::CheckingForUpdate,
         );
         let release = zed::latest_github_release(
-            "u-zzam/solidity",
+            "u-zzam/solidity-for-foundry",
             zed::GithubReleaseOptions { require_assets: true, pre_release: false },
         )?;
 
@@ -38,14 +38,14 @@ impl SolidityExtension {
             _ => return Err(format!("unsupported platform: {os:?}/{arch:?}")),
         };
         let exe = if matches!(os, zed::Os::Windows) { ".exe" } else { "" };
-        let asset_name = format!("solidity-lsp-{triple}{exe}");
+        let asset_name = format!("solidity-for-foundry-lsp-{triple}{exe}");
         let asset = release
             .assets
             .iter()
             .find(|a| a.name == asset_name)
             .ok_or_else(|| format!("no release asset named {asset_name}"))?;
 
-        let dir = format!("solidity-lsp-{}", release.version);
+        let dir = format!("solidity-for-foundry-lsp-{}", release.version);
         let path = format!("{dir}/{asset_name}");
         if !std::fs::metadata(&path).is_ok_and(|m| m.is_file()) {
             zed::set_language_server_installation_status(
@@ -58,7 +58,7 @@ impl SolidityExtension {
             if let Ok(entries) = std::fs::read_dir(".") {
                 for entry in entries.flatten() {
                     let name = entry.file_name().to_string_lossy().into_owned();
-                    if name.starts_with("solidity-lsp-") && name != dir {
+                    if name.starts_with("solidity-for-foundry-lsp-") && name != dir {
                         std::fs::remove_dir_all(entry.path()).ok();
                     }
                 }

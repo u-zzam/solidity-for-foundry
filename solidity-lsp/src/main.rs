@@ -384,7 +384,7 @@ impl LanguageServer for Backend {
     async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
-                name: "solidity-lsp".into(),
+                name: "solidity-for-foundry-lsp".into(),
                 version: Some(env!("CARGO_PKG_VERSION").into()),
             }),
             capabilities: ServerCapabilities {
@@ -432,7 +432,7 @@ impl LanguageServer for Backend {
 
     async fn initialized(&self, _: InitializedParams) {
         self.client
-            .log_message(MessageType::INFO, "solidity-lsp ready")
+            .log_message(MessageType::INFO, "solidity-for-foundry-lsp ready")
             .await;
     }
 

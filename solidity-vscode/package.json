@@ -1,11 +1,11 @@
 {
-  "name": "solidity-foundry",
-  "displayName": "Solidity (Foundry)",
-  "description": "Foundry-native Solidity language server: diagnostics, formatting and navigation on your project's exact solc version.",
+  "name": "solidity-for-foundry",
+  "displayName": "Solidity for Foundry",
+  "description": "The Solidity language server for the modern, Foundry-native stack: diagnostics, formatting, and navigation on your project's exact solc version.",
   "version": "0.1.0",
   "license": "MIT",
   "publisher": "u-zzam",
-  "repository": { "type": "git", "url": "https://github.com/u-zzam/solidity" },
+  "repository": { "type": "git", "url": "https://github.com/u-zzam/solidity-for-foundry" },
   "engines": { "vscode": "^1.75.0" },
   "categories": ["Programming Languages"],
   "activationEvents": ["onLanguage:solidity"],
@@ -27,12 +27,12 @@
       }
     ],
     "configuration": {
-      "title": "Solidity (Foundry)",
+      "title": "Solidity for Foundry",
       "properties": {
         "solidity.serverPath": {
           "type": "string",
           "default": "",
-          "description": "Path to the solidity-lsp server binary. Leave empty to download the release binary matching this extension's version automatically; set to a path (or a name on PATH, e.g. \"solidity-lsp\") to use your own build."
+          "description": "Path to the solidity-for-foundry-lsp server binary. Leave empty to download the release binary matching this extension's version automatically; set to a path (or a name on PATH, e.g. \"solidity-for-foundry-lsp\") to use your own build."
         }
       }
     }

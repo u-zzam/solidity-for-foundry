@@ -1,4 +1,4 @@
-# solidity
+# Solidity for Foundry
 
 A **Foundry-native Solidity language server** — the same behavior in every editor, always on your project's exact solc version, with imports resolved exactly like `forge build`.
 
@@ -30,24 +30,25 @@ lint). The server itself auto-downloads the solc version your project pins (via
 svm) on first compile.
 
 - **VS Code / Zed:** nothing to build — the extension downloads the prebuilt
-  `solidity-lsp` binary matching its version from the GitHub release on first
-  activation. (If a `solidity-lsp` is already on your `PATH`, Zed uses it.)
+  `solidity-for-foundry-lsp` binary matching its version from the GitHub release
+  on first activation. (If a `solidity-for-foundry-lsp` is already on your
+  `PATH`, Zed uses it.)
 - **Other editors, or to build from source:** install the binary with Rust:
 
   ```sh
   cargo install --path solidity-lsp --locked
   ```
 
-  This puts `solidity-lsp` on your `PATH`. (`--locked` uses the pinned
-  `Cargo.lock`; required on Rust < 1.95.)
+  This puts `solidity-for-foundry-lsp` on your `PATH`. (`--locked` uses the
+  pinned `Cargo.lock`; required on Rust < 1.95.)
 
 ## Editor setup
 
-Every editor runs the *same* `solidity-lsp` binary, so behavior is identical.
+Every editor runs the *same* `solidity-for-foundry-lsp` binary, so behavior is identical.
 
 **VS Code** — install the [`solidity-vscode`](./solidity-vscode) extension
 (press F5 from that folder for a dev host). It downloads and spawns
-`solidity-lsp` automatically; set `solidity.serverPath` to use your own build.
+`solidity-for-foundry-lsp` automatically; set `solidity.serverPath` to use your own build.
 
 **Zed** — install [`solidity-zed`](./solidity-zed) as a dev extension
 (`zed: install dev extension`). It downloads the server binary, or uses one on
@@ -57,30 +58,30 @@ your `PATH`.
 
 ```lua
 vim.filetype.add({ extension = { sol = "solidity" } })
-vim.lsp.config("solidity_foundry", {
-  cmd = { "solidity-lsp" },
+vim.lsp.config("solidity_for_foundry", {
+  cmd = { "solidity-for-foundry-lsp" },
   filetypes = { "solidity" },
   root_markers = { "foundry.toml" },
 })
-vim.lsp.enable("solidity_foundry")
+vim.lsp.enable("solidity_for_foundry")
 ```
 
 **Helix** (`languages.toml`):
 
 ```toml
-[language-server.solidity-lsp]
-command = "solidity-lsp"
+[language-server.solidity-for-foundry-lsp]
+command = "solidity-for-foundry-lsp"
 
 [[language]]
 name = "solidity"
-language-servers = ["solidity-lsp"]
+language-servers = ["solidity-for-foundry-lsp"]
 ```
 
 **Emacs** (eglot):
 
 ```elisp
 (with-eval-after-load 'eglot
-  (add-to-list 'eglot-server-programs '(solidity-mode . ("solidity-lsp"))))
+  (add-to-list 'eglot-server-programs '(solidity-mode . ("solidity-for-foundry-lsp"))))
 ```
 
 ## Features

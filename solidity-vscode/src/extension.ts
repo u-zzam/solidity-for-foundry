@@ -16,7 +16,7 @@ import * as path from "path";
 
 let client: LanguageClient | undefined;
 
-const REPO = "u-zzam/solidity";
+const REPO = "u-zzam/solidity-for-foundry";
 
 /// The release asset's Rust target triple for the current platform.
 function targetTriple(): string | undefined {
@@ -74,7 +74,7 @@ async function ensureServer(
   if (!triple) {
     window.showErrorMessage(
       `solidity: no prebuilt server for ${process.platform}/${process.arch}. ` +
-        `Set "solidity.serverPath" to a locally built solidity-lsp.`,
+        `Set "solidity.serverPath" to a locally built solidity-for-foundry-lsp.`,
     );
     return undefined;
   }
@@ -82,14 +82,14 @@ async function ensureServer(
   const exe = process.platform === "win32" ? ".exe" : "";
   const dir = context.globalStorageUri.fsPath;
   fs.mkdirSync(dir, { recursive: true });
-  const dest = path.join(dir, `solidity-lsp-${version}${exe}`);
+  const dest = path.join(dir, `solidity-for-foundry-lsp-${version}${exe}`);
   if (fs.existsSync(dest)) {
     return dest;
   }
-  const url = `https://github.com/${REPO}/releases/download/v${version}/solidity-lsp-${triple}${exe}`;
+  const url = `https://github.com/${REPO}/releases/download/v${version}/solidity-for-foundry-lsp-${triple}${exe}`;
   try {
     await window.withProgress(
-      { location: ProgressLocation.Notification, title: `Downloading solidity-lsp ${version}…` },
+      { location: ProgressLocation.Notification, title: `Downloading solidity-for-foundry-lsp ${version}…` },
       () => download(url, dest),
     );
     if (process.platform !== "win32") {
@@ -100,7 +100,7 @@ async function ensureServer(
     fs.rmSync(dest, { force: true });
     window.showErrorMessage(
       `solidity: could not download the server (${e}). Set "solidity.serverPath" ` +
-        "to a locally built solidity-lsp, or run `cargo install --path solidity-lsp`.",
+        "to a locally built solidity-for-foundry-lsp, or run `cargo install --path solidity-lsp`.",
     );
     return undefined;
   }
@@ -131,7 +131,7 @@ export async function activate(context: ExtensionContext): Promise<void> {
 
   client = new LanguageClient(
     "solidity",
-    "Solidity (Foundry)",
+    "Solidity for Foundry",
     serverOptions,
     clientOptions,
   );
