@@ -263,6 +263,13 @@ impl Index {
         Self { files, path_to_index, decls, refs_by_decl, containers, callables, top_level }
     }
 
+    /// Whether the index was built from exactly `text` for `path` — i.e. its
+    /// byte offsets line up with that buffer, so the solc-accurate answers can
+    /// be trusted over the live parser.
+    pub fn matches(&self, path: &Path, text: &str) -> bool {
+        self.slot_for(path).and_then(|i| self.files.get(&i)).is_some_and(|f| f.text == text)
+    }
+
     /// Files declaring a top-level symbol named `name`, for import suggestions.
     pub fn import_candidates(&self, name: &str) -> Vec<PathBuf> {
         let mut out: Vec<PathBuf> = Vec::new();

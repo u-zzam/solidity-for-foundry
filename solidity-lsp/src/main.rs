@@ -40,6 +40,10 @@ struct State {
     /// concurrently (single-flight per root, not globally). A std mutex so the
     /// RAII guard can clear a root on drop (including on panic) without awaiting.
     indexing: std::sync::Mutex<HashSet<PathBuf>>,
+    /// Per-root generation counter that debounces index rebuilds: a burst of
+    /// saves bumps it repeatedly and only the last one survives the delay, so
+    /// the heavy full compile is coalesced and kept off the save's hot path.
+    index_gen: Mutex<HashMap<PathBuf, u64>>,
     /// Latest document version per URI, to debounce live as-you-type checks.
     live_versions: Mutex<HashMap<Url, i32>>,
     /// forge lint quick-fixes from the last compile, per URI, for code actions.
@@ -146,16 +150,18 @@ impl Backend {
         *published = next;
     }
 
-    /// The Foundry root whose solc index should answer for `uri`: it exists and
-    /// the buffer matches disk, so the index's byte offsets are still valid.
-    /// Returns `None` — meaning "use the live parser instead" — when the file is
-    /// unindexed (cold start), edited since the last compile (stale positions),
-    /// or has no `foundry.toml` at all.
+    /// The Foundry root whose solc index should answer for `uri`: an index
+    /// exists whose stored text for this file is byte-for-byte the live buffer,
+    /// so its positions are exactly valid. Returns `None` — "use the live parser
+    /// instead" — when the file is unindexed (cold start), has been edited since
+    /// the index was built (the parser is then both live and correct), or has no
+    /// `foundry.toml` at all.
     async fn valid_index_root(&self, uri: &Url) -> Option<PathBuf> {
         let path = uri.to_file_path().ok()?;
         let root = project::locate_root(&path)?;
-        let present = self.state.index.read().await.contains_key(&root);
-        (present && !self.is_dirty(uri).await).then_some(root)
+        let buffer = self.state.docs.read().await.get(uri).cloned()?;
+        let guard = self.state.index.read().await;
+        guard.get(&root)?.matches(&path, &buffer).then_some(root)
     }
 
     /// Whether `uri` has an open buffer that differs from its on-disk content
@@ -171,11 +177,14 @@ impl Backend {
         std::fs::read_to_string(&path).map_or(true, |disk| disk != buffer)
     }
 
-    /// Rebuild the navigation index from a full compile of the owning project.
+    /// Rebuild the accuracy index from a full compile of the owning project.
     /// Single-flighted per root: while one project's build runs, further
     /// requests for the same root are dropped (the next save retriggers), but a
     /// different project can index concurrently. The full compile is the cost of
-    /// cross-file node-id consistency; solar will make this live in a later phase.
+    /// cross-file node-id consistency — solc only emits a complete, consistent
+    /// AST set from a cold compile of every source, so this can't ride the warm
+    /// incremental diagnostics compile. The live tree-sitter parser covers
+    /// navigation while this refreshes in the background.
     async fn build_index(&self, uri: Url) {
         let Ok(path) = uri.to_file_path() else {
             return;
@@ -280,9 +289,31 @@ impl Backend {
         tokio::spawn(async move { me.run_diagnostics(uri).await });
     }
 
+    /// Refresh the accuracy index off the hot path: debounced per root so a run
+    /// of saves collapses into a single full compile after editing settles.
+    /// Navigation never waits on this — the live parser already answers — so a
+    /// short delay only affects when the more precise solc resolution kicks in.
     fn schedule_index(&self, uri: Url) {
         let me = self.clone();
-        tokio::spawn(async move { me.build_index(uri).await });
+        tokio::spawn(async move {
+            let Some(root) =
+                uri.to_file_path().ok().and_then(|p| project::locate_root(&p))
+            else {
+                return;
+            };
+            let gen = {
+                let mut g = me.state.index_gen.lock().await;
+                let next = g.get(&root).copied().unwrap_or(0) + 1;
+                g.insert(root.clone(), next);
+                next
+            };
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+            // A newer save superseded this one; let that one do the compile.
+            if me.state.index_gen.lock().await.get(&root).copied() != Some(gen) {
+                return;
+            }
+            me.build_index(uri).await;
+        });
     }
 
     /// Type-check the buffer immediately (no debounce) — used on open so the
