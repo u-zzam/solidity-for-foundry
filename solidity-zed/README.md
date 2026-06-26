@@ -3,23 +3,32 @@
 Thin Zed client for [`solidity-for-foundry-lsp`](../solidity-lsp). Registers the
 Solidity language and runs the shared server, so behavior matches every other editor.
 
-## Requirements
+## Install
 
-The `solidity-for-foundry-lsp` binary on your `PATH`:
+Install the extension — it uses a `solidity-for-foundry-lsp` already on your
+`PATH`, otherwise it downloads the matching binary from the GitHub release. So
+there's nothing else to build.
 
-```sh
-cargo install --path ../solidity-lsp --locked
-```
+Requirements:
 
-## Install (dev)
+- **[Foundry](https://getfoundry.sh)** (`forge`) on your `PATH` — the server
+  shells out to it for `forge fmt` / `forge lint`, and auto-installs the solc
+  version your project pins via svm.
+- Disable any other Solidity extension and reload — an editor binds each `.sol`
+  file to a single language server.
 
-Build the wasm extension and install it as a dev extension in Zed
-(`zed: install dev extension` → pick this directory):
+## Install as a dev extension
+
+`zed: install dev extension` → pick this directory. Zed compiles the wasm
+extension itself; the manual build below just verifies it:
 
 ```sh
 rustup target add wasm32-wasip1
 cargo build --target wasm32-wasip1
 ```
 
-Zed compiles the extension itself on install; the manual build above just
-verifies it.
+To run your own server build, put it on your `PATH`:
+
+```sh
+cargo install --path ../solidity-lsp --locked   # installs solidity-for-foundry-lsp
+```
