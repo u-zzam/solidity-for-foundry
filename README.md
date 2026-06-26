@@ -90,13 +90,14 @@ Implemented:
 - **Diagnostics** byte-identical to `forge build` — any solc version (auto-installed), correct imports/remappings, the same warning suppression (`ignored_error_codes`, `ignored_warnings_from`).
 - **As-you-type diagnostics** — the unsaved buffer is type-checked live (no codegen, no disk writes).
 - **Formatting** via `forge fmt`.
-- **Navigation** — go-to-definition, find references, hover (rendered signatures + NatSpec), document & workspace symbols, document highlight. Live from a tree-sitter parse the instant a file opens and as you type; sharpened by the solc AST once a compile lands.
-- **Completion** — type-aware member completion after `.`, plus in-scope symbols (available immediately from the parse, before any compile) — and **signature help**.
-- **Rename** across declarations and references.
+- **Navigation** — go-to-definition, type-definition, implementation, find references, document highlight, hover (rendered signatures + NatSpec), document & workspace symbols. Live from a tree-sitter parse the instant a file opens and as you type; sharpened by the solc AST once a compile lands (type-definition and implementation use it).
+- **Completion** — type-aware member completion after `.`; in-scope symbols; Solidity keywords, the global builtins and `msg.`/`block.`/`tx.`/`abi.` members, and snippets; and import-path completion (sibling files plus remapping prefixes) — all available before any compile. Plus **signature help**.
+- **Rename** across declarations and references, with a prepare/validate pre-flight that rejects reserved or malformed names.
 - **Inlay hints** — call-site parameter names (functions, events, errors, struct constructors).
 - **Syntax highlighting** — a TextMate grammar in VS Code (tree-sitter in Zed) colors files immediately, then **semantic tokens** recolor each identifier by what it resolves to.
 - **Code actions** — `forge lint` fixes, add a missing SPDX identifier or pragma, and import an undeclared symbol from where it's defined.
 - **`forge lint`** warnings surfaced inline.
+- **No `foundry.toml` required** — a single `.sol` file outside any project still gets navigation, completion, and standalone (self-contained) diagnostics.
 - **Monorepos** — several `foundry.toml` roots open at once each keep their own index.
 
 Planned: solar-based *type-aware* live resolution (live navigation is name-based today, made precise by the solc AST on the next compile); published Marketplace / Open VSX / Zed registry listings.
