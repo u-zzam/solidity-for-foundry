@@ -466,6 +466,17 @@ pub fn check_buffer(root: &Path, target: &Path, buffer: &str) -> Result<Vec<Solc
     Ok(filter_errors(output.errors, root, &cfg))
 }
 
+/// The remapping prefixes configured for a project (e.g. `@openzeppelin/`),
+/// sorted and deduped, for import-path completion.
+pub fn remapping_prefixes(root: &Path) -> Vec<String> {
+    let cfg = parse_config(root);
+    let mut names: Vec<String> =
+        resolve_remappings(root, &cfg).into_iter().map(|r| r.name).collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// Detect a concrete solc version from the file's `pragma solidity` line, for
 /// config-less single-file checking. Returns the first `x.y.z` the line names
 /// (e.g. the lower bound of `>=0.8.0 <0.9.0`, or the base of `^0.8.20`).

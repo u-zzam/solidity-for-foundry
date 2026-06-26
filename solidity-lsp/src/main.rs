@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, RwLock};
@@ -7,6 +7,7 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
+mod complete;
 mod diagnostics;
 mod index;
 mod parse;
@@ -558,23 +559,55 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         let offset = diagnostics::PositionMapper::new(&text).offset(p.position);
+
+        // Import path: sibling files/dirs relative to this file, plus the
+        // project's remapping prefixes. No index or parse needed.
+        if let Some(prefix) = complete::import_path_context(&text, offset) {
+            let path = uri.to_file_path().ok();
+            let dir = path.as_deref().and_then(Path::parent).map(Path::to_path_buf);
+            let remaps = path
+                .as_deref()
+                .and_then(project::locate_root)
+                .map(|r| project::remapping_prefixes(&r))
+                .unwrap_or_default();
+            let items =
+                dir.map(|d| complete::import_completions(&d, &prefix, &remaps)).unwrap_or_default();
+            return Ok((!items.is_empty()).then_some(CompletionResponse::Array(items)));
+        }
+
         let container = member_context(&text, offset);
-        // Accurate solc index when valid, else the live parser (cold start,
-        // mid-edit, or no foundry.toml).
-        let items = if let Some(root) = self.valid_index_root(&uri).await {
-            let guard = self.state.index.read().await;
-            match (&container, guard.get(&root)) {
-                (Some(c), Some(idx)) => idx.member_completions(c),
-                (None, Some(idx)) => idx.global_completions(),
-                _ => Vec::new(),
+        let mut items = Vec::new();
+        match &container {
+            Some(c) => {
+                // Magic-global members (msg./block./tx./abi.) are always available.
+                items.extend(complete::member_builtins(c));
+                // User-defined members: accurate index when valid, else the parser.
+                if let Some(root) = self.valid_index_root(&uri).await {
+                    if let Some(idx) = self.state.index.read().await.get(&root) {
+                        items.extend(idx.member_completions(c));
+                    }
+                } else {
+                    let parsed = self.state.parsed.read().await;
+                    items.extend(parse::member_completions(&parsed, c));
+                }
             }
-        } else {
-            let parsed = self.state.parsed.read().await;
-            match &container {
-                Some(c) => parse::member_completions(&parsed, c),
-                None => parse::global_completions(&parsed),
+            None => {
+                // User-defined symbols in scope (index when valid, else parser).
+                if let Some(root) = self.valid_index_root(&uri).await {
+                    if let Some(idx) = self.state.index.read().await.get(&root) {
+                        items.extend(idx.global_completions());
+                    }
+                } else {
+                    let parsed = self.state.parsed.read().await;
+                    items.extend(parse::global_completions(&parsed));
+                }
+                // Keywords, global builtins and snippets — offered before any
+                // index or parse has project-specific symbols.
+                items.extend(complete::keywords());
+                items.extend(complete::global_builtins());
+                items.extend(complete::snippets());
             }
-        };
+        }
         Ok((!items.is_empty()).then_some(CompletionResponse::Array(items)))
     }
 
