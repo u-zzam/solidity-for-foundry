@@ -13,7 +13,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use foundry_compilers::artifacts::{
-    Error as SolcError, EvmVersion, Optimizer, Remapping, Settings, Source,
+    Error as SolcError, EvmVersion, Optimizer, Remapping, Settings, SolcInput, Source,
 };
 use foundry_compilers::solc::{Solc, SolcCompiler, SolcLanguage, SolcSettings};
 use foundry_compilers::{ProjectBuilder, ProjectPathsConfig};
@@ -466,6 +466,38 @@ pub fn check_buffer(root: &Path, target: &Path, buffer: &str) -> Result<Vec<Solc
     Ok(filter_errors(output.errors, root, &cfg))
 }
 
+/// Detect a concrete solc version from the file's `pragma solidity` line, for
+/// config-less single-file checking. Returns the first `x.y.z` the line names
+/// (e.g. the lower bound of `>=0.8.0 <0.9.0`, or the base of `^0.8.20`).
+fn detect_solc(text: &str) -> Option<Version> {
+    let line = text.lines().find(|l| l.trim_start().starts_with("pragma solidity"))?;
+    line.split(|c: char| !c.is_ascii_digit() && c != '.')
+        .find_map(|tok| Version::parse(tok).ok())
+}
+
+/// Type-check a single self-contained buffer that has no Foundry project, for
+/// config-less live diagnostics. Files with imports are skipped: without a
+/// project their imports can't be resolved, and surfacing false "file not found"
+/// errors is precisely the failure mode this server exists to avoid. solc is
+/// taken from the buffer's pragma and auto-installed via svm.
+pub fn check_standalone(target: &Path, buffer: &str) -> Result<Vec<SolcError>, String> {
+    if buffer.lines().any(|l| l.trim_start().starts_with("import ")) {
+        return Ok(Vec::new());
+    }
+    let version = detect_solc(buffer).ok_or("no concrete solc version in pragma")?;
+    let solc = Solc::find_or_install(&version).map_err(|e| e.to_string())?;
+
+    let mut input = SolcInput::default();
+    input.sources.insert(target.to_path_buf(), Source::new(buffer));
+    input.settings.output_selection = Default::default(); // type-check only
+    let input = input.sanitized(&version);
+
+    let output = solc.compile_exact(&input).map_err(|e| e.to_string())?;
+    // Apply forge's default warning suppression (license, code-size, …).
+    let root = target.parent().unwrap_or(target);
+    Ok(filter_errors(output.errors, root, &Config::default()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,6 +544,20 @@ mod tests {
         assert_eq!(parse_config(&root).solc, Some(Version::new(0, 8, 19)));
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn detects_pragma_solc_version() {
+        assert_eq!(detect_solc("pragma solidity 0.8.20;"), Some(Version::new(0, 8, 20)));
+        assert_eq!(detect_solc("pragma solidity ^0.8.19;"), Some(Version::new(0, 8, 19)));
+        // A range takes the first (lower-bound) concrete version.
+        assert_eq!(
+            detect_solc("pragma solidity >=0.8.0 <0.9.0;"),
+            Some(Version::new(0, 8, 0))
+        );
+        // No pragma, or no concrete x.y.z, yields nothing.
+        assert_eq!(detect_solc("contract C {}"), None);
+        assert_eq!(detect_solc("pragma solidity ^0.8;"), None);
     }
 
     #[test]

@@ -338,7 +338,9 @@ impl Backend {
     }
 
     /// Type-check the unsaved buffer and publish the edited file's diagnostics.
-    /// Silently no-ops if the project doesn't pin solc; on-save still covers it.
+    /// With a Foundry project this type-checks against the real import graph;
+    /// without one it falls back to a standalone single-file check (config-less).
+    /// Silently no-ops if no solc version can be determined.
     async fn live_check(&self, uri: Url) {
         let Ok(path) = uri.to_file_path() else {
             return;
@@ -346,22 +348,26 @@ impl Backend {
         if path.extension().and_then(|e| e.to_str()) != Some("sol") {
             return;
         }
-        let Some(root) = project::locate_root(&path) else {
-            return;
-        };
         let Some(buffer) = self.state.docs.read().await.get(&uri).cloned() else {
             return;
         };
 
+        let root = project::locate_root(&path);
         let (r, t, buf) = (root.clone(), path.clone(), buffer.clone());
-        let Ok(Ok(errors)) =
-            tokio::task::spawn_blocking(move || project::check_buffer(&r, &t, &buf)).await
-        else {
+        let errors = tokio::task::spawn_blocking(move || match r {
+            Some(r) => project::check_buffer(&r, &t, &buf),
+            None => project::check_standalone(&t, &buf),
+        })
+        .await;
+        let Ok(Ok(errors)) = errors else {
             return;
         };
 
-        // Map positions against the buffer solc actually compiled, not disk.
-        let diags = diagnostics::for_buffer(&errors, &root, &uri, &buffer);
+        // Map positions against the buffer solc actually compiled, not disk. With
+        // no project root, errors carry the file's own absolute path, so any base
+        // works for the URI match; use the file's parent.
+        let base = root.unwrap_or_else(|| path.parent().unwrap_or(&path).to_path_buf());
+        let diags = diagnostics::for_buffer(&errors, &base, &uri, &buffer);
         let mut published = self.state.published.lock().await;
         if diags.is_empty() {
             published.remove(&uri);
