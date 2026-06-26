@@ -9,6 +9,7 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 mod diagnostics;
 mod index;
+mod parse;
 mod project;
 
 #[derive(Clone)]
@@ -21,6 +22,10 @@ struct Backend {
 struct State {
     /// Open document buffers, keyed by URI. Full-text sync keeps these current.
     docs: RwLock<HashMap<Url, String>>,
+    /// Live tree-sitter parse of each open buffer, re-run on every edit. Drives
+    /// navigation instantly (no compile, no foundry.toml) and while typing; the
+    /// solc index is preferred only when it has valid, non-stale positions.
+    parsed: RwLock<HashMap<Url, parse::File>>,
     /// URIs we last published diagnostics for, so we can clear stale ones.
     published: Mutex<HashSet<Url>>,
     /// Serializes project compiles; one solc run at a time is plenty for an editor.
@@ -139,6 +144,18 @@ impl Backend {
                 .await;
         }
         *published = next;
+    }
+
+    /// The Foundry root whose solc index should answer for `uri`: it exists and
+    /// the buffer matches disk, so the index's byte offsets are still valid.
+    /// Returns `None` — meaning "use the live parser instead" — when the file is
+    /// unindexed (cold start), edited since the last compile (stale positions),
+    /// or has no `foundry.toml` at all.
+    async fn valid_index_root(&self, uri: &Url) -> Option<PathBuf> {
+        let path = uri.to_file_path().ok()?;
+        let root = project::locate_root(&path)?;
+        let present = self.state.index.read().await.contains_key(&root);
+        (present && !self.is_dirty(uri).await).then_some(root)
     }
 
     /// Whether `uri` has an open buffer that differs from its on-disk content
@@ -339,6 +356,7 @@ impl LanguageServer for Backend {
                 document_formatting_provider: Some(OneOf::Left(true)),
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
+                document_highlight_provider: Some(OneOf::Left(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
@@ -384,73 +402,98 @@ impl LanguageServer for Backend {
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
         let p = params.text_document_position_params;
-        let Ok(path) = p.text_document.uri.to_file_path() else {
-            return Ok(None);
-        };
-        let Some(root) = project::locate_root(&path) else {
-            return Ok(None);
-        };
-        let guard = self.state.index.read().await;
-        let Some(idx) = guard.get(&root) else {
-            return Ok(None);
-        };
-        Ok(idx
-            .definition(&path, p.position)
-            .map(GotoDefinitionResponse::Scalar))
+        let uri = p.text_document.uri;
+        // Accurate solc index, when present and not stale.
+        if let Some(root) = self.valid_index_root(&uri).await {
+            if let Ok(path) = uri.to_file_path() {
+                let guard = self.state.index.read().await;
+                if let Some(loc) =
+                    guard.get(&root).and_then(|idx| idx.definition(&path, p.position))
+                {
+                    return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
+                }
+            }
+        }
+        // Live parser fallback (cold start, mid-edit, or no foundry.toml).
+        let parsed = self.state.parsed.read().await;
+        let locs = parse::definition(&parsed, &uri, p.position);
+        Ok((!locs.is_empty()).then_some(GotoDefinitionResponse::Array(locs)))
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
         let p = params.text_document_position;
-        let Ok(path) = p.text_document.uri.to_file_path() else {
-            return Ok(None);
-        };
-        let Some(root) = project::locate_root(&path) else {
-            return Ok(None);
-        };
-        let guard = self.state.index.read().await;
-        let Some(idx) = guard.get(&root) else {
-            return Ok(None);
-        };
-        let locs = idx.references(&path, p.position, params.context.include_declaration);
+        let uri = p.text_document.uri;
+        let include = params.context.include_declaration;
+        if let Some(root) = self.valid_index_root(&uri).await {
+            if let Ok(path) = uri.to_file_path() {
+                let guard = self.state.index.read().await;
+                if let Some(idx) = guard.get(&root) {
+                    let locs = idx.references(&path, p.position, include);
+                    if !locs.is_empty() {
+                        return Ok(Some(locs));
+                    }
+                }
+            }
+        }
+        let parsed = self.state.parsed.read().await;
+        let locs = parse::references(&parsed, &uri, p.position, include);
         Ok((!locs.is_empty()).then_some(locs))
+    }
+
+    async fn document_highlight(
+        &self,
+        params: DocumentHighlightParams,
+    ) -> Result<Option<Vec<DocumentHighlight>>> {
+        // Always live: highlight every occurrence of the name under the cursor in
+        // the current buffer, straight from the tree-sitter parse.
+        let p = params.text_document_position_params;
+        let parsed = self.state.parsed.read().await;
+        let Some(file) = parsed.get(&p.text_document.uri) else {
+            return Ok(None);
+        };
+        let hl = parse::highlights(file, p.position);
+        Ok((!hl.is_empty()).then_some(hl))
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let p = params.text_document_position_params;
-        let Ok(path) = p.text_document.uri.to_file_path() else {
-            return Ok(None);
-        };
-        let Some(root) = project::locate_root(&path) else {
-            return Ok(None);
-        };
-        let guard = self.state.index.read().await;
-        let Some(idx) = guard.get(&root) else {
-            return Ok(None);
-        };
-        Ok(idx.hover(&path, p.position).map(|value| Hover {
-            contents: HoverContents::Markup(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value,
-            }),
-            range: None,
-        }))
+        let uri = p.text_document.uri;
+        if let Some(root) = self.valid_index_root(&uri).await {
+            if let Ok(path) = uri.to_file_path() {
+                let guard = self.state.index.read().await;
+                if let Some(value) = guard.get(&root).and_then(|idx| idx.hover(&path, p.position)) {
+                    return Ok(Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value,
+                        }),
+                        range: None,
+                    }));
+                }
+            }
+        }
+        let parsed = self.state.parsed.read().await;
+        Ok(parse::hover(&parsed, &uri, p.position))
     }
 
     async fn document_symbol(
         &self,
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
-        let Ok(path) = params.text_document.uri.to_file_path() else {
-            return Ok(None);
-        };
-        let Some(root) = project::locate_root(&path) else {
-            return Ok(None);
-        };
-        let guard = self.state.index.read().await;
-        let Some(idx) = guard.get(&root) else {
-            return Ok(None);
-        };
-        let syms = idx.document_symbols(&path);
+        let uri = params.text_document.uri;
+        if let Some(root) = self.valid_index_root(&uri).await {
+            if let Ok(path) = uri.to_file_path() {
+                let guard = self.state.index.read().await;
+                if let Some(idx) = guard.get(&root) {
+                    let syms = idx.document_symbols(&path);
+                    if !syms.is_empty() {
+                        return Ok(Some(DocumentSymbolResponse::Nested(syms)));
+                    }
+                }
+            }
+        }
+        let parsed = self.state.parsed.read().await;
+        let syms = parsed.get(&uri).map(parse::document_symbols).unwrap_or_default();
         Ok((!syms.is_empty()).then_some(DocumentSymbolResponse::Nested(syms)))
     }
 
@@ -458,29 +501,42 @@ impl LanguageServer for Backend {
         &self,
         params: WorkspaceSymbolParams,
     ) -> Result<Option<Vec<SymbolInformation>>> {
-        // Search every open project's index so workspace symbols span a monorepo.
+        // Search every open project's index so workspace symbols span a monorepo;
+        // fall back to the open buffers before any compile has produced one.
         let guard = self.state.index.read().await;
-        let out: Vec<SymbolInformation> =
-            guard.values().flat_map(|idx| idx.workspace_symbols(&params.query)).collect();
-        Ok(Some(out))
+        if !guard.is_empty() {
+            let out: Vec<SymbolInformation> =
+                guard.values().flat_map(|idx| idx.workspace_symbols(&params.query)).collect();
+            return Ok(Some(out));
+        }
+        drop(guard);
+        let parsed = self.state.parsed.read().await;
+        Ok(Some(parse::workspace_symbols(&parsed, &params.query)))
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         let p = params.text_document_position;
-        let Some(text) = self.state.docs.read().await.get(&p.text_document.uri).cloned() else {
-            return Ok(None);
-        };
-        let Some(root) = p.text_document.uri.to_file_path().ok().and_then(|path| project::locate_root(&path)) else {
+        let uri = p.text_document.uri;
+        let Some(text) = self.state.docs.read().await.get(&uri).cloned() else {
             return Ok(None);
         };
         let offset = diagnostics::PositionMapper::new(&text).offset(p.position);
-        let guard = self.state.index.read().await;
-        let Some(idx) = guard.get(&root) else {
-            return Ok(None);
-        };
-        let items = match member_context(&text, offset) {
-            Some(container) => idx.member_completions(&container),
-            None => idx.global_completions(),
+        let container = member_context(&text, offset);
+        // Accurate solc index when valid, else the live parser (cold start,
+        // mid-edit, or no foundry.toml).
+        let items = if let Some(root) = self.valid_index_root(&uri).await {
+            let guard = self.state.index.read().await;
+            match (&container, guard.get(&root)) {
+                (Some(c), Some(idx)) => idx.member_completions(c),
+                (None, Some(idx)) => idx.global_completions(),
+                _ => Vec::new(),
+            }
+        } else {
+            let parsed = self.state.parsed.read().await;
+            match &container {
+                Some(c) => parse::member_completions(&parsed, c),
+                None => parse::global_completions(&parsed),
+            }
         };
         Ok((!items.is_empty()).then_some(CompletionResponse::Array(items)))
     }
@@ -647,7 +703,11 @@ impl LanguageServer for Backend {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let doc = params.text_document;
+        // Parse immediately so navigation works the instant the file opens —
+        // before (and independent of) the background compile and index.
+        let file = parse::parse(&doc.text);
         self.state.docs.write().await.insert(doc.uri.clone(), doc.text);
+        self.state.parsed.write().await.insert(doc.uri.clone(), file);
         // Fast type-check first (instant feedback), then the full codegen
         // compile + navigation index in the background.
         self.schedule_live_check_now(doc.uri.clone());
@@ -658,9 +718,12 @@ impl LanguageServer for Backend {
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri;
         let version = params.text_document.version;
-        // FULL sync: the last change carries the entire document text.
+        // FULL sync: the last change carries the entire document text. Re-parse
+        // just this buffer so navigation stays live while typing.
         if let Some(change) = params.content_changes.into_iter().next_back() {
+            let file = parse::parse(&change.text);
             self.state.docs.write().await.insert(uri.clone(), change.text);
+            self.state.parsed.write().await.insert(uri.clone(), file);
         }
         self.state.live_versions.lock().await.insert(uri.clone(), version);
         self.schedule_live_check(uri, version);
@@ -673,6 +736,7 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         self.state.docs.write().await.remove(&params.text_document.uri);
+        self.state.parsed.write().await.remove(&params.text_document.uri);
     }
 }
 
