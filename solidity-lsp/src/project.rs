@@ -12,6 +12,7 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+use foundry_compilers::artifacts::output_selection::OutputSelection;
 use foundry_compilers::artifacts::{
     Error as SolcError, EvmVersion, Optimizer, Remapping, Settings, SolcInput, Source,
 };
@@ -408,9 +409,18 @@ pub fn compile(root: &Path, full: bool) -> Result<CompileOutput, String> {
     paths.artifacts = work.join("out");
     paths.build_infos = work.join("out").join("build-info");
 
+    let mut settings = build_settings(&cfg);
+    if full {
+        // The navigation index only consumes the typed AST, so request just that
+        // and let solc skip code generation, the optimizer and via-ir — the bulk
+        // of the compile cost on real projects (the index build that drives the
+        // editor's "Indexing…" spinner). Diagnostics keep their own full compile.
+        settings.output_selection = OutputSelection::ast_output_selection();
+    }
+
     let project = ProjectBuilder::<SolcCompiler>::default()
         .paths(paths)
-        .settings(SolcSettings { settings: build_settings(&cfg), cli_settings: Default::default() })
+        .settings(SolcSettings { settings, cli_settings: Default::default() })
         .build(build_compiler(&cfg)?)
         .map_err(|e| e.to_string())?;
 
