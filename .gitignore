@@ -16,3 +16,9 @@ solidity-zed/target/
 # Zed-downloaded grammar sources (fetched on extension install)
 solidity-zed/grammars/
 solidity-zed/extension.wasm
+
+# Local Claude Code instructions (machine-specific paths; kept out of the public repo)
+CLAUDE.md
+
+# Internal design / analysis docs (kept local, out of the public repo)
+docs/
