@@ -38,6 +38,9 @@ struct Decl {
     /// for call-site inlay hints. Empty string for an unnamed parameter.
     param_names: Vec<String>,
     doc: Option<String>,
+    /// For a variable/parameter/field of a user-defined type, the declaration id
+    /// of that type (its `typeName`'s `referencedDeclaration`), for go-to-type.
+    type_decl: Option<i64>,
 }
 
 /// A member of a contract / library / struct / enum, for `.` completion.
@@ -122,6 +125,9 @@ pub struct Index {
     /// Declaration ids that are top-level (direct children of a source unit),
     /// i.e. importable by name. Used to suggest imports for unresolved symbols.
     top_level: HashSet<i64>,
+    /// Base callable id -> the ids of functions that override it, for
+    /// go-to-implementation (an interface/virtual function -> its overrides).
+    impls: HashMap<i64, Vec<i64>>,
 }
 
 impl Index {
@@ -137,6 +143,7 @@ impl Index {
         // their tokens (and references) color as parameters, not variables.
         let mut param_ids: HashSet<i64> = HashSet::new();
         let mut top_level: HashSet<i64> = HashSet::new();
+        let mut impls: HashMap<i64, Vec<i64>> = HashMap::new();
 
         for s in sources {
             let Ok(text) = std::fs::read_to_string(&s.path) else {
@@ -171,6 +178,14 @@ impl Index {
                         ) {
                             callables.entry(name.to_string()).or_default().push(id);
                             collect_param_ids(map, &mut param_ids);
+                            // Record this function as an implementation of each
+                            // base it overrides (inverse of `baseFunctions`).
+                            if let Some(bases) = map.get("baseFunctions").and_then(|b| b.as_array())
+                            {
+                                for base in bases.iter().filter_map(|b| b.as_i64()) {
+                                    impls.entry(base).or_default().push(id);
+                                }
+                            }
                         }
                         decls.entry(id).or_insert_with(|| Decl {
                             src_index: s.index,
@@ -183,6 +198,7 @@ impl Index {
                             params: param_list(map, "parameters"),
                             param_names: decl_param_names(map),
                             doc: documentation(map),
+                            type_decl: type_ref(map),
                         });
                         return;
                     }
@@ -260,7 +276,16 @@ impl Index {
             }
         }
 
-        Self { files, path_to_index, decls, refs_by_decl, containers, callables, top_level }
+        Self {
+            files,
+            path_to_index,
+            decls,
+            refs_by_decl,
+            containers,
+            callables,
+            top_level,
+            impls,
+        }
     }
 
     /// Whether the index was built from exactly `text` for `path` — i.e. its
@@ -268,6 +293,49 @@ impl Index {
     /// be trusted over the live parser.
     pub fn matches(&self, path: &Path, text: &str) -> bool {
         self.slot_for(path).and_then(|i| self.files.get(&i)).is_some_and(|f| f.text == text)
+    }
+
+    /// The declaration of the *type* of the symbol under the cursor: for a
+    /// variable/parameter/field of a user-defined type, its type's declaration;
+    /// for a type name itself, that type. `None` for elementary types.
+    pub fn type_definition(&self, path: &Path, pos: Position) -> Option<Location> {
+        let id = self.resolve(path, pos)?;
+        let d = self.decls.get(&id)?;
+        match d.type_decl {
+            Some(tid) => self.decl_location(tid),
+            None if is_type_decl(&d.kind) => self.decl_location(id),
+            None => None,
+        }
+    }
+
+    /// Functions that override the callable under the cursor (an interface or
+    /// virtual function -> its concrete implementations). Falls back to the
+    /// declaration itself when nothing overrides it.
+    pub fn implementations(&self, path: &Path, pos: Position) -> Vec<Location> {
+        let Some(id) = self.resolve(path, pos) else {
+            return Vec::new();
+        };
+        match self.impls.get(&id) {
+            Some(ids) => ids.iter().filter_map(|i| self.decl_location(*i)).collect(),
+            None => self.decl_location(id).into_iter().collect(),
+        }
+    }
+
+    /// The range of the renameable identifier under the cursor (the token, not
+    /// its declaration), or `None` if it doesn't resolve to a known declaration.
+    pub fn rename_range(&self, path: &Path, pos: Position) -> Option<Range> {
+        let slot = self.slot_for(path)?;
+        let f = self.files.get(&slot)?;
+        let offset = PositionMapper::new(&f.text).offset(pos);
+        let span = f
+            .spans
+            .iter()
+            .filter(|s| s.start <= offset && offset < s.end)
+            .min_by_key(|s| s.end - s.start)?;
+        self.decls.contains_key(&span.decl).then(|| {
+            let m = PositionMapper::new(&f.text);
+            Range::new(m.position(span.start), m.position(span.end))
+        })
     }
 
     /// Files declaring a top-level symbol named `name`, for import suggestions.
@@ -877,6 +945,26 @@ fn type_string(map: &Map<String, Value>) -> Option<String> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(String::from)
+}
+
+/// The declaration id a declaration's `typeName` references — the user-defined
+/// type of a variable/parameter/field. `None` for elementary types.
+fn type_ref(map: &Map<String, Value>) -> Option<i64> {
+    map.get("typeName")
+        .and_then(|t| t.get("referencedDeclaration"))
+        .and_then(|v| v.as_i64())
+        .filter(|id| *id >= 0)
+}
+
+/// Whether a declaration kind is itself a type, so go-to-type lands on it.
+fn is_type_decl(kind: &str) -> bool {
+    matches!(
+        kind,
+        "ContractDefinition"
+            | "StructDefinition"
+            | "EnumDefinition"
+            | "UserDefinedValueTypeDefinition"
+    )
 }
 
 fn documentation(map: &Map<String, Value>) -> Option<String> {

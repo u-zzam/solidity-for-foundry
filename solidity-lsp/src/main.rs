@@ -393,12 +393,17 @@ impl LanguageServer for Backend {
                 )),
                 document_formatting_provider: Some(OneOf::Left(true)),
                 definition_provider: Some(OneOf::Left(true)),
+                type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
+                implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
                 references_provider: Some(OneOf::Left(true)),
                 document_highlight_provider: Some(OneOf::Left(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
-                rename_provider: Some(OneOf::Left(true)),
+                rename_provider: Some(OneOf::Right(RenameOptions {
+                    prepare_provider: Some(true),
+                    work_done_progress_options: Default::default(),
+                })),
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec![".".to_string()]),
                     ..Default::default()
@@ -456,6 +461,47 @@ impl LanguageServer for Backend {
         let parsed = self.state.parsed.read().await;
         let locs = parse::definition(&parsed, &uri, p.position);
         Ok((!locs.is_empty()).then_some(GotoDefinitionResponse::Array(locs)))
+    }
+
+    async fn goto_type_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        // The type of a symbol is solc type information — only the index has it.
+        let p = params.text_document_position_params;
+        let uri = p.text_document.uri;
+        if let Some(root) = self.valid_index_root(&uri).await {
+            if let Ok(path) = uri.to_file_path() {
+                let guard = self.state.index.read().await;
+                if let Some(loc) =
+                    guard.get(&root).and_then(|idx| idx.type_definition(&path, p.position))
+                {
+                    return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    async fn goto_implementation(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        // Override resolution needs solc's `baseFunctions` — index only.
+        let p = params.text_document_position_params;
+        let uri = p.text_document.uri;
+        if let Some(root) = self.valid_index_root(&uri).await {
+            if let Ok(path) = uri.to_file_path() {
+                let guard = self.state.index.read().await;
+                if let Some(idx) = guard.get(&root) {
+                    let locs = idx.implementations(&path, p.position);
+                    if !locs.is_empty() {
+                        return Ok(Some(GotoDefinitionResponse::Array(locs)));
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
@@ -733,12 +779,40 @@ impl LanguageServer for Backend {
         Ok((!hints.is_empty()).then_some(hints))
     }
 
+    async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> Result<Option<PrepareRenameResponse>> {
+        // Offer rename only where the accurate index can actually carry it out,
+        // so the editor's pre-flight matches what `rename` will do.
+        let uri = params.text_document.uri;
+        if let Some(root) = self.valid_index_root(&uri).await {
+            if let Ok(path) = uri.to_file_path() {
+                let guard = self.state.index.read().await;
+                if let Some(range) =
+                    guard.get(&root).and_then(|idx| idx.rename_range(&path, params.position))
+                {
+                    return Ok(Some(PrepareRenameResponse::Range(range)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
+        // Reject names solc would — empty, bad characters, or reserved words —
+        // before touching the document, surfacing the reason to the editor.
+        if let Err(msg) = valid_new_name(&params.new_name) {
+            return Err(tower_lsp::jsonrpc::Error::invalid_params(msg));
+        }
         let p = params.text_document_position;
-        let Ok(path) = p.text_document.uri.to_file_path() else {
+        let uri = p.text_document.uri;
+        // Rename through the accurate index only (name-based parser rename could
+        // hit unrelated same-named symbols); needs valid, non-stale positions.
+        let Some(root) = self.valid_index_root(&uri).await else {
             return Ok(None);
         };
-        let Some(root) = project::locate_root(&path) else {
+        let Ok(path) = uri.to_file_path() else {
             return Ok(None);
         };
         let guard = self.state.index.read().await;
@@ -909,6 +983,27 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
 }
 
+/// Validate a rename target is a legal Solidity identifier and not reserved.
+fn valid_new_name(name: &str) -> std::result::Result<(), String> {
+    match name.bytes().next() {
+        None => return Err("name cannot be empty".to_string()),
+        Some(b) if b.is_ascii_digit() => {
+            return Err("identifier cannot start with a digit".to_string())
+        }
+        Some(b) if !is_ident_byte(b) => {
+            return Err("identifier must start with a letter, '_' or '$'".to_string())
+        }
+        Some(_) => {}
+    }
+    if !name.bytes().all(is_ident_byte) {
+        return Err("identifier may only contain letters, digits, '_' or '$'".to_string());
+    }
+    if complete::is_reserved(name) {
+        return Err(format!("`{name}` is a reserved word"));
+    }
+    Ok(())
+}
+
 /// If the cursor is completing `<ident>.<partial>`, return `<ident>`.
 fn member_context(text: &str, offset: usize) -> Option<String> {
     let b = text.as_bytes();
@@ -976,10 +1071,23 @@ async fn main() {
 mod tests {
     use super::{
         call_context, header_edit, import_line, member_context, pragma_from_message,
-        relative_import,
+        relative_import, valid_new_name,
     };
     use std::path::Path;
     use tower_lsp::lsp_types::Position;
+
+    #[test]
+    fn rename_target_validation() {
+        assert!(valid_new_name("totalSupply").is_ok());
+        assert!(valid_new_name("_x").is_ok());
+        assert!(valid_new_name("$y2").is_ok());
+        // Empty, digit-led, bad characters and reserved words are rejected.
+        assert!(valid_new_name("").is_err());
+        assert!(valid_new_name("2cool").is_err());
+        assert!(valid_new_name("a-b").is_err());
+        assert!(valid_new_name("contract").is_err());
+        assert!(valid_new_name("uint256").is_err());
+    }
 
     #[test]
     fn header_edit_handles_missing_trailing_newline() {

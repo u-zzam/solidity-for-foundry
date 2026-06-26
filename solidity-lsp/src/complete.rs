@@ -32,6 +32,17 @@ pub fn keywords() -> Vec<CompletionItem> {
     KEYWORDS.iter().map(|k| item(k, CompletionItemKind::KEYWORD, "")).collect()
 }
 
+/// Whether `word` is a keyword, reserved word or builtin literal, so it can't be
+/// the new name in a rename.
+pub fn is_reserved(word: &str) -> bool {
+    KEYWORDS.contains(&word)
+        || matches!(
+            word,
+            "true" | "false" | "wei" | "gwei" | "ether" | "seconds" | "minutes" | "hours" | "days"
+                | "weeks" | "years" | "this" | "super" | "now" | "msg" | "block" | "tx" | "abi"
+        )
+}
+
 /// Global builtin functions and magic objects (`require`, `keccak256`, `msg`, …).
 pub fn global_builtins() -> Vec<CompletionItem> {
     const FUNCS: &[(&str, &str)] = &[
