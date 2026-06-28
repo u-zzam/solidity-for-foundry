@@ -13,8 +13,8 @@ use std::collections::{HashMap, HashSet};
 
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, DocumentHighlight, DocumentHighlightKind, DocumentSymbol,
-    Hover, HoverContents, Location, MarkupContent, MarkupKind, Position, Range, SymbolInformation,
-    SymbolKind, Url,
+    Hover, HoverContents, InlayHint, InlayHintKind, InlayHintLabel, Location, MarkupContent,
+    MarkupKind, Position, Range, SymbolInformation, SymbolKind, Url,
 };
 use tree_sitter::{Node, Parser};
 
@@ -71,6 +71,14 @@ impl DefKind {
         !matches!(self, DefKind::Local | DefKind::Param | DefKind::Field | DefKind::EnumValue)
     }
 
+    /// Carries an ordered parameter list a call site can label with names.
+    fn takes_args(self) -> bool {
+        matches!(
+            self,
+            DefKind::Function | DefKind::Modifier | DefKind::Event | DefKind::Error | DefKind::Struct
+        )
+    }
+
     fn symbol_kind(self) -> SymbolKind {
         match self {
             DefKind::Contract | DefKind::Library => SymbolKind::CLASS,
@@ -116,6 +124,9 @@ struct Def {
     container: Option<String>,
     /// A rendered header (`function f(uint a) public`) for hover/completion.
     detail: String,
+    /// Ordered parameter names for callables/structs, for call-site inlay hints.
+    /// Empty for non-callables; an unnamed parameter is an empty string.
+    params: Vec<String>,
 }
 
 /// One identifier occurrence (declaration site or reference), for cursor
@@ -128,11 +139,27 @@ struct Ident {
     is_def: bool,
 }
 
+/// A call site (`f(a, b)`, `emit E(x)`, `mod(y)`) and its positional arguments,
+/// for call-site parameter-name inlay hints.
+struct Call {
+    callee: String,
+    args: Vec<Arg>,
+}
+
+/// One positional argument: where its expression starts, and the argument's own
+/// identifier when it is a bare name (so a hint that would merely repeat the
+/// parameter name can be suppressed).
+struct Arg {
+    byte: usize,
+    ident: Option<String>,
+}
+
 /// A single parsed buffer.
 pub struct File {
     pub text: String,
     defs: Vec<Def>,
     idents: Vec<Ident>,
+    calls: Vec<Call>,
 }
 
 thread_local! {
@@ -152,9 +179,10 @@ pub fn parse(text: &str) -> File {
     let tree = PARSER.with(|p| p.borrow_mut().parse(text, None));
     let mut defs = Vec::new();
     let mut idents = Vec::new();
+    let mut calls = Vec::new();
     if let Some(tree) = tree {
         let src = text.as_bytes();
-        walk(tree.root_node(), src, None, &mut defs, &mut idents);
+        walk(tree.root_node(), src, None, &mut defs, &mut idents, &mut calls);
         // Mark identifier occurrences that coincide with a declaration's name.
         let def_spans: HashSet<(usize, usize)> =
             defs.iter().map(|d| (d.name_start, d.name_end)).collect();
@@ -162,7 +190,7 @@ pub fn parse(text: &str) -> File {
             id.is_def = def_spans.contains(&(id.start, id.end));
         }
     }
-    File { text: text.to_string(), defs, idents }
+    File { text: text.to_string(), defs, idents, calls }
 }
 
 /// Recursive traversal: record declarations (carrying their enclosing type
@@ -173,6 +201,7 @@ fn walk<'a>(
     container: Option<&str>,
     defs: &mut Vec<Def>,
     idents: &mut Vec<Ident>,
+    calls: &mut Vec<Call>,
 ) {
     if matches!(node.kind(), "identifier" | "enum_value") {
         if let Ok(name) = node.utf8_text(src) {
@@ -189,6 +218,11 @@ fn walk<'a>(
         }
     }
 
+    if let Some(call) = call_of(node, src) {
+        calls.push(call);
+        // Fall through to descend into the arguments (nested calls, identifiers).
+    }
+
     if let Some((name, kind, ns, ne)) = def_of(node, src) {
         let detail = header(node, src);
         defs.push(Def {
@@ -200,20 +234,21 @@ fn walk<'a>(
             full_end: node.end_byte(),
             container: container.map(str::to_string),
             detail,
+            params: param_names(node, src),
         });
         // Descend with this node as the container if it is a type scope.
         let inner = kind.is_container().then_some(name);
         let child_container = inner.as_deref().or(container);
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
-            walk(child, src, child_container, defs, idents);
+            walk(child, src, child_container, defs, idents, calls);
         }
         return;
     }
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        walk(child, src, container, defs, idents);
+        walk(child, src, container, defs, idents, calls);
     }
 }
 
@@ -263,6 +298,96 @@ fn header(node: Node, src: &[u8]) -> String {
     let raw = raw.split('=').next().unwrap_or(raw);
     let raw = raw.trim().trim_end_matches([';', '{']).trim();
     raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Ordered parameter names of a callable or struct, so a call site can label
+/// each positional argument. An unnamed parameter yields an empty string.
+fn param_names(node: Node, src: &[u8]) -> Vec<String> {
+    let child_kind = match node.kind() {
+        "function_definition" | "modifier_definition" => "parameter",
+        "event_definition" => "event_parameter",
+        "error_declaration" => "error_parameter",
+        "struct_declaration" => "struct_member",
+        _ => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() != child_kind {
+            continue;
+        }
+        let name = child
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(src).ok())
+            .unwrap_or("")
+            .to_string();
+        out.push(name);
+    }
+    out
+}
+
+/// Unwrap the grammar's `expression` supertype wrapper to the concrete node it
+/// holds (`(expression (identifier))` -> the identifier).
+fn inner_expr(mut node: Node) -> Node {
+    while node.kind() == "expression" {
+        match node.named_child(0) {
+            Some(child) => node = child,
+            None => break,
+        }
+    }
+    node
+}
+
+/// The callee name of a call: a bare `identifier`, or the rightmost name of a
+/// `member_expression` (`Lib.add` -> `add`). `None` for any other expression.
+fn callee_name(node: Node, src: &[u8]) -> Option<String> {
+    let node = inner_expr(node);
+    match node.kind() {
+        "identifier" => node.utf8_text(src).ok().map(String::from),
+        "member_expression" => node
+            .child_by_field_name("property")
+            .and_then(|p| p.utf8_text(src).ok())
+            .map(String::from),
+        _ => None,
+    }
+}
+
+/// Extract a call site from `node` if it is one we hint: `f(...)` / `Lib.f(...)`
+/// (`call_expression`), `emit E(...)` (`emit_statement`), or a modifier use
+/// (`modifier_invocation`). Returns `None` for named-argument calls (`f({a: 1})`,
+/// whose names are already in source) and argument-less invocations.
+fn call_of(node: Node, src: &[u8]) -> Option<Call> {
+    let callee = match node.kind() {
+        "call_expression" => callee_name(node.child_by_field_name("function")?, src)?,
+        "emit_statement" => callee_name(node.child_by_field_name("name")?, src)?,
+        "modifier_invocation" => {
+            let mut cursor = node.walk();
+            let id = node.named_children(&mut cursor).find(|c| c.kind() == "identifier")?;
+            id.utf8_text(src).ok()?.to_string()
+        }
+        _ => return None,
+    };
+    let mut args = Vec::new();
+    let mut cursor = node.walk();
+    for ca in node.named_children(&mut cursor) {
+        if ca.kind() != "call_argument" {
+            continue;
+        }
+        let mut inner_cursor = ca.walk();
+        let Some(inner) = ca.named_children(&mut inner_cursor).next() else {
+            continue;
+        };
+        // `f({a: 1})` carries its names in source already — don't hint this call.
+        if inner.kind() == "call_struct_argument" {
+            return None;
+        }
+        let expr = inner_expr(inner);
+        let ident = (expr.kind() == "identifier")
+            .then(|| expr.utf8_text(src).ok().map(String::from))
+            .flatten();
+        args.push(Arg { byte: expr.start_byte(), ident });
+    }
+    (!args.is_empty()).then_some(Call { callee, args })
 }
 
 /// The identifier occurrence under `offset`, if any (smallest containing span).
@@ -475,6 +600,67 @@ fn completion_for(d: &Def) -> CompletionItem {
     }
 }
 
+/// Call-site parameter-name inlay hints within `range`, resolved by name across
+/// the open buffers. Name-based and best-effort (no type inference): a uniquely
+/// named callee is used directly, overloads are matched by arity so a hint is
+/// never the wrong signature. The caller prefers the accurate, cross-file index;
+/// this keeps hints live while typing, before the index is in sync, and through
+/// compile errors.
+pub fn call_hints(files: &HashMap<Url, File>, uri: &Url, range: Range) -> Vec<InlayHint> {
+    let Some(file) = files.get(uri) else {
+        return Vec::new();
+    };
+    // Parameter lists by callee name, gathered from every open buffer.
+    let mut by_name: HashMap<&str, Vec<&Vec<String>>> = HashMap::new();
+    for f in files.values() {
+        for d in &f.defs {
+            if d.kind.takes_args() {
+                by_name.entry(d.name.as_str()).or_default().push(&d.params);
+            }
+        }
+    }
+
+    let m = PositionMapper::new(&file.text);
+    let mut out = Vec::new();
+    for call in &file.calls {
+        let Some(cands) = by_name.get(call.callee.as_str()) else {
+            continue;
+        };
+        let params = if cands.len() == 1 {
+            Some(cands[0])
+        } else {
+            cands.iter().copied().find(|p| p.len() == call.args.len())
+        };
+        let Some(params) = params else {
+            continue;
+        };
+        for (i, arg) in call.args.iter().enumerate() {
+            let pos = m.position(arg.byte);
+            if pos < range.start || pos > range.end {
+                continue;
+            }
+            let Some(name) = params.get(i).filter(|n| !n.is_empty()) else {
+                continue;
+            };
+            // An argument that already spells the parameter needs no hint.
+            if arg.ident.as_deref() == Some(name.as_str()) {
+                continue;
+            }
+            out.push(InlayHint {
+                position: pos,
+                label: InlayHintLabel::String(format!("{name}:")),
+                kind: Some(InlayHintKind::PARAMETER),
+                text_edits: None,
+                tooltip: None,
+                padding_left: Some(false),
+                padding_right: Some(true),
+                data: None,
+            });
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,6 +761,24 @@ contract Counter {
         let h = hover(&files, &uri, at).unwrap();
         let HoverContents::Markup(mc) = h.contents else { panic!() };
         assert!(mc.value.contains("function add(uint a, uint b) internal pure returns (uint)"));
+    }
+
+    #[test]
+    fn call_hints_label_arguments_by_name() {
+        let (files, uri) = store();
+        let m = PositionMapper::new(SRC);
+        let full = Range::new(m.position(0), m.position(SRC.len()));
+        let labels: Vec<String> = call_hints(&files, &uri, full)
+            .iter()
+            .map(|h| match &h.label {
+                InlayHintLabel::String(s) => s.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        // MathLib.add(count, by) -> a:, b:  and  emit Bumped(count) -> newCount:
+        assert!(labels.contains(&"a:".to_string()), "{labels:?}");
+        assert!(labels.contains(&"b:".to_string()), "{labels:?}");
+        assert!(labels.contains(&"newCount:".to_string()), "{labels:?}");
     }
 
     #[test]

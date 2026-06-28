@@ -796,17 +796,24 @@ impl LanguageServer for Backend {
     }
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
-        let Ok(path) = params.text_document.uri.to_file_path() else {
-            return Ok(None);
-        };
-        let Some(root) = project::locate_root(&path) else {
-            return Ok(None);
-        };
-        let guard = self.state.index.read().await;
-        let Some(idx) = guard.get(&root) else {
-            return Ok(None);
-        };
-        let hints = idx.inlay_hints(&path, params.range);
+        let uri = params.text_document.uri;
+        let range = params.range;
+        // Accurate, cross-file hints from the index when it matches the buffer.
+        if let Some(root) = self.valid_index_root(&uri).await {
+            if let Ok(path) = uri.to_file_path() {
+                let guard = self.state.index.read().await;
+                if let Some(idx) = guard.get(&root) {
+                    let hints = idx.inlay_hints(&path, range);
+                    if !hints.is_empty() {
+                        return Ok(Some(hints));
+                    }
+                }
+            }
+        }
+        // Live parser fallback: tracks the buffer while typing, before the index
+        // is in sync (cold start, just-edited), and through compile errors.
+        let parsed = self.state.parsed.read().await;
+        let hints = parse::call_hints(&parsed, &uri, range);
         Ok((!hints.is_empty()).then_some(hints))
     }
 
