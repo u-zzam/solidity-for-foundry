@@ -926,6 +926,41 @@ impl LanguageServer for Backend {
         self.state.docs.write().await.remove(&params.text_document.uri);
         self.state.parsed.write().await.remove(&params.text_document.uri);
     }
+
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        // foundry.toml / remappings.txt edits change a project's config (solc
+        // version, remappings, source layout), and a .sol file can change on disk
+        // outside the editor (forge install, branch switch). Re-check and
+        // re-index every open buffer in an affected root. Skip events for .sol
+        // files we already have open — did_change / did_save own those, and
+        // re-triggering here would double-compile.
+        let open: Vec<Url> = self.state.docs.read().await.keys().cloned().collect();
+        let mut roots: HashSet<PathBuf> = HashSet::new();
+        for change in &params.changes {
+            let Ok(path) = change.uri.to_file_path() else {
+                continue;
+            };
+            let is_sol = path.extension().and_then(|e| e.to_str()) == Some("sol");
+            if is_sol && open.contains(&change.uri) {
+                continue;
+            }
+            if let Some(root) = project::locate_root(&path) {
+                roots.insert(root);
+            }
+        }
+        if roots.is_empty() {
+            return;
+        }
+        for uri in &open {
+            let Ok(p) = uri.to_file_path() else {
+                continue;
+            };
+            if project::locate_root(&p).is_some_and(|r| roots.contains(&r)) {
+                self.schedule_live_check_now(uri.clone());
+                self.schedule_index(uri.clone());
+            }
+        }
+    }
 }
 
 /// Whether two LSP ranges intersect (touching counts), so a code action is

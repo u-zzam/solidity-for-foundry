@@ -137,7 +137,11 @@ function newClient(command: string): LanguageClient {
   const clientOptions: LanguageClientOptions = {
     documentSelector: [{ scheme: "file", language: "solidity" }],
     synchronize: {
-      fileEvents: workspace.createFileSystemWatcher("**/*.sol"),
+      // .sol sources plus the project config: editing remappings or the solc
+      // pin should re-resolve imports and re-check open files.
+      fileEvents: workspace.createFileSystemWatcher(
+        "**/{*.sol,foundry.toml,remappings.txt}",
+      ),
     },
   };
   return new LanguageClient(
