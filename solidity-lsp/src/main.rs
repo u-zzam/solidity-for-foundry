@@ -223,6 +223,13 @@ impl Backend {
         match built {
             Ok(Ok(Some(idx))) => {
                 self.state.index.write().await.insert(root.clone(), idx);
+                // Tell the editor to re-pull the features derived from this index.
+                // Without these, rebuilt inlay hints and semantic tokens sit unused
+                // until the user happens to scroll, edit, or refocus — which reads
+                // as hints flickering in and out after a compile. (Both clients
+                // advertise refreshSupport, so the re-request actually fires.)
+                let _ = self.client.inlay_hint_refresh().await;
+                let _ = self.client.semantic_tokens_refresh().await;
                 self.client
                     .log_message(MessageType::INFO, format!("indexed {}", root.display()))
                     .await;
