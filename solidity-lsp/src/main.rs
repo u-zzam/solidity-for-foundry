@@ -756,10 +756,15 @@ impl LanguageServer for Backend {
         &self,
         params: SemanticTokensParams,
     ) -> Result<Option<SemanticTokensResult>> {
-        let Ok(path) = params.text_document.uri.to_file_path() else {
+        let uri = params.text_document.uri;
+        // Only recolor from the index when its positions exactly match the live
+        // buffer. On any divergence (mid-edit, cold start) return None so the
+        // editor keeps its TextMate grammar instead of painting the precomputed
+        // tokens onto identifiers that have since shifted.
+        let Some(root) = self.valid_index_root(&uri).await else {
             return Ok(None);
         };
-        let Some(root) = project::locate_root(&path) else {
+        let Ok(path) = uri.to_file_path() else {
             return Ok(None);
         };
         let guard = self.state.index.read().await;
