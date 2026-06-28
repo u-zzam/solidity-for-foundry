@@ -32,10 +32,14 @@ function targetTriple(): string | undefined {
 /// Download `url` to `dest`, following GitHub's redirect to the asset storage.
 function download(url: string, dest: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(dest);
+    // Stream into a sibling .part file and rename only once it is fully written,
+    // so a process kill mid-download can never leave a truncated binary at `dest`
+    // that the next launch trusts via existsSync.
+    const part = `${dest}.part`;
+    const file = fs.createWriteStream(part);
     const fail = (e: Error) => {
       file.destroy();
-      fs.rm(dest, () => reject(e));
+      fs.rm(part, () => reject(e));
     };
     file.on("error", fail); // disk write failure (full disk, permissions)
     const get = (u: string, redirects: number) => {
@@ -59,7 +63,20 @@ function download(url: string, dest: string): Promise<void> {
             return;
           }
           res.pipe(file);
-          file.on("finish", () => file.close(() => resolve()));
+          file.on("finish", () =>
+            file.close((err) => {
+              if (err) {
+                fail(err);
+                return;
+              }
+              try {
+                fs.renameSync(part, dest);
+                resolve();
+              } catch (e) {
+                fail(e as Error);
+              }
+            }),
+          );
         },
       );
       req.on("error", fail);
