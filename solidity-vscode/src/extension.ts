@@ -43,8 +43,10 @@ function download(url: string, dest: string): Promise<void> {
         fail(new Error("too many redirects"));
         return;
       }
-      https
-        .get(u, { headers: { "User-Agent": "solidity-vscode" } }, (res) => {
+      const req = https.get(
+        u,
+        { headers: { "User-Agent": "solidity-vscode" } },
+        (res) => {
           const status = res.statusCode ?? 0;
           if (status >= 300 && status < 400 && res.headers.location) {
             res.resume();
@@ -58,8 +60,13 @@ function download(url: string, dest: string): Promise<void> {
           }
           res.pipe(file);
           file.on("finish", () => file.close(() => resolve()));
-        })
-        .on("error", fail);
+        },
+      );
+      req.on("error", fail);
+      // Abort a stalled or half-open socket instead of hanging the
+      // "Downloading…" notification forever; destroy(err) surfaces through the
+      // error handler above. Each redirect is a fresh request, so set it here.
+      req.setTimeout(30_000, () => req.destroy(new Error("download timed out")));
     };
     get(url, 0);
   });
