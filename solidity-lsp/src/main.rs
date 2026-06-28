@@ -126,7 +126,17 @@ impl Backend {
             .await;
 
         let mut published = self.state.published.lock().await;
+        // Files this on-disk compile reported on. Dirty buffers stay seeded here
+        // but are not republished below — the live buffer check owns them.
+        let mut next: HashSet<Url> = new.keys().cloned().collect();
         for (uri, diags) in &new {
+            // Skip files with unsaved edits: their squiggles come from the live
+            // buffer check against the in-memory text. Publishing disk-mapped
+            // ranges here would jump them to stale offsets (and briefly resurrect
+            // a just-fixed error) until the next keystroke.
+            if self.is_dirty(uri).await {
+                continue;
+            }
             self.client
                 .publish_diagnostics(uri.clone(), diags.clone(), None)
                 .await;
@@ -135,7 +145,6 @@ impl Backend {
         // files with unsaved edits, whose squiggles are owned by the live buffer
         // check (this on-disk compile would otherwise wipe them until the next
         // keystroke).
-        let mut next: HashSet<Url> = new.keys().cloned().collect();
         for uri in published.iter() {
             if new.contains_key(uri) {
                 continue;
