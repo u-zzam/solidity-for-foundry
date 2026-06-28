@@ -37,6 +37,10 @@ jobs:
             target: x86_64-apple-darwin
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          # Native ARM runner: aws-lc-sys (C crypto) does not cross-compile from
+          # x86, so the arm64 Linux binary is built on an arm64 host.
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
