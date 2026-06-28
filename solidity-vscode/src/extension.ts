@@ -175,6 +175,18 @@ export async function activate(context: ExtensionContext): Promise<void> {
       await client?.stop();
       await startClient(context);
     }),
+    workspace.onDidChangeConfiguration(async (e) => {
+      if (!e.affectsConfiguration("solidity.serverPath")) {
+        return;
+      }
+      const pick = await window.showInformationMessage(
+        "solidity.serverPath changed — restart the Solidity server to apply it.",
+        "Restart",
+      );
+      if (pick === "Restart") {
+        await commands.executeCommand("solidity.restartServer");
+      }
+    }),
   );
   await startClient(context);
 }

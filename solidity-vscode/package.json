@@ -40,6 +40,12 @@
           "type": "string",
           "default": "",
           "description": "Path to the solidity-for-foundry-lsp server binary. Leave empty to download the release binary matching this extension's version automatically; set to a path (or a name on PATH, e.g. \"solidity-for-foundry-lsp\") to use your own build."
+        },
+        "solidity.trace.server": {
+          "type": "string",
+          "enum": ["off", "messages", "verbose"],
+          "default": "off",
+          "description": "Trace the communication between VS Code and the Solidity language server, shown in the server's output channel."
         }
       }
     }
