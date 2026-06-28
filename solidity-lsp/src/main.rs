@@ -654,20 +654,30 @@ impl LanguageServer for Backend {
                 }
             }
             None => {
-                // User-defined symbols in scope (index when valid, else parser).
-                if let Some(root) = self.valid_index_root(&uri).await {
-                    if let Some(idx) = self.state.index.read().await.get(&root) {
-                        items.extend(idx.global_completions());
-                    }
+                // Symbols in scope (accurate index when valid, else the parser).
+                let symbols = if let Some(root) = self.valid_index_root(&uri).await {
+                    self.state
+                        .index
+                        .read()
+                        .await
+                        .get(&root)
+                        .map(|idx| idx.global_completions())
+                        .unwrap_or_default()
                 } else {
                     let parsed = self.state.parsed.read().await;
-                    items.extend(parse::global_completions(&parsed));
-                }
-                // Keywords, global builtins and snippets — offered before any
-                // index or parse has project-specific symbols.
-                items.extend(complete::keywords());
-                items.extend(complete::global_builtins());
-                items.extend(complete::snippets());
+                    parse::global_completions(&parsed)
+                };
+                // Merge with snippets, builtins and keywords, collapsing duplicate
+                // labels — VS Code only merges items sharing both label and kind,
+                // so the `contract` keyword and `contract` snippet would otherwise
+                // both show. A snippet or builtin outranks the bare keyword of the
+                // same name; a stable per-group sort_text keeps the ordering fixed.
+                items = dedup_completions(vec![
+                    symbols,
+                    complete::snippets(),
+                    complete::global_builtins(),
+                    complete::keywords(),
+                ]);
             }
         }
         Ok((!items.is_empty()).then_some(CompletionResponse::Array(items)))
@@ -1077,6 +1087,24 @@ fn call_context(text: &str, offset: usize) -> Option<(String, u32)> {
     None
 }
 
+/// Concatenate completion groups in priority order, dropping any later item
+/// whose label was already taken (so a richer snippet/builtin wins over the bare
+/// keyword of the same name), and stamp each with a `sort_text` that preserves
+/// the group order in the editor's list.
+fn dedup_completions(groups: Vec<Vec<CompletionItem>>) -> Vec<CompletionItem> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for (bucket, group) in groups.into_iter().enumerate() {
+        for mut item in group {
+            if seen.insert(item.label.clone()) {
+                item.sort_text = Some(format!("{bucket}{}", item.label));
+                out.push(item);
+            }
+        }
+    }
+    out
+}
+
 #[tokio::main]
 async fn main() {
     let (service, socket) = LspService::new(|client| Backend {
@@ -1163,5 +1191,25 @@ mod tests {
         assert_eq!(call_context("min(a, max(b,", 13), Some(("max".into(), 1)));
         // a statement boundary means we are not inside a call
         assert_eq!(call_context("x = 1; y", 8), None);
+    }
+
+    #[test]
+    fn dedup_completions_collapses_labels_and_orders_groups() {
+        use tower_lsp::lsp_types::CompletionItem;
+        let mk = |l: &str| CompletionItem { label: l.into(), ..Default::default() };
+        let out = super::dedup_completions(vec![
+            vec![mk("Foo")],                     // 0: in-scope symbol
+            vec![mk("contract")],                // 1: snippet
+            vec![mk("contract"), mk("require")], // 2: builtins (dup `contract` dropped)
+            vec![mk("contract"), mk("public")],  // 3: keywords (dup `contract` dropped)
+        ]);
+        let labels: Vec<_> = out.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["Foo", "contract", "require", "public"]);
+        // sort_text encodes the surviving group, so the list order is stable.
+        let st = |l: &str| out.iter().find(|i| i.label == l).unwrap().sort_text.clone().unwrap();
+        assert!(st("Foo").starts_with('0'));
+        assert!(st("contract").starts_with('1')); // the snippet won the label
+        assert!(st("require").starts_with('2'));
+        assert!(st("public").starts_with('3'));
     }
 }
