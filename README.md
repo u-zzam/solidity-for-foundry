@@ -110,6 +110,8 @@ Implemented:
 - **No `foundry.toml` required** — a single `.sol` file outside any project still gets navigation, completion, and standalone (self-contained) diagnostics.
 - **Monorepos** — several `foundry.toml` roots open at once each keep their own index.
 
+Verified against real Foundry codebases — Morpho Blue, Aave v3 & v4, Uniswap v4 Core — spanning solc 0.8.19–0.8.35, paris through cancun.
+
 Planned: solar-based *type-aware* live resolution (live navigation is name-based today, made precise by the solc AST on the next compile); published Marketplace / Open VSX / Zed registry listings.
 
 ## License
