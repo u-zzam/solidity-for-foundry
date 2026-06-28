@@ -893,14 +893,27 @@ impl LanguageServer for Backend {
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri;
         let version = params.text_document.version;
-        // FULL sync: the last change carries the entire document text. Re-parse
-        // just this buffer so navigation stays live while typing.
-        if let Some(change) = params.content_changes.into_iter().next_back() {
-            let file = parse::parse(&change.text);
-            self.state.docs.write().await.insert(uri.clone(), change.text);
-            self.state.parsed.write().await.insert(uri.clone(), file);
-        }
         self.state.live_versions.lock().await.insert(uri.clone(), version);
+        // FULL sync: the last change carries the entire document text. Store it
+        // synchronously so diagnostics and index-validity see the current text at
+        // once, then re-parse off the message loop — a from-scratch tree-sitter
+        // parse of a large file would otherwise stall stdin/stdout and queued
+        // requests on every keystroke. A version guard discards an out-of-order
+        // parse so a slower earlier one can't clobber a newer tree.
+        if let Some(change) = params.content_changes.into_iter().next_back() {
+            self.state.docs.write().await.insert(uri.clone(), change.text.clone());
+            let me = self.clone();
+            let (u, text) = (uri.clone(), change.text);
+            tokio::spawn(async move {
+                let Ok(file) = tokio::task::spawn_blocking(move || parse::parse(&text)).await
+                else {
+                    return;
+                };
+                if me.state.live_versions.lock().await.get(&u).copied() == Some(version) {
+                    me.state.parsed.write().await.insert(u, file);
+                }
+            });
+        }
         self.schedule_live_check(uri, version);
     }
 
