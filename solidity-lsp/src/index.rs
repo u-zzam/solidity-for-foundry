@@ -410,10 +410,10 @@ impl Index {
         let d = self.decls.get(&id)?;
         let mut md = format!("```solidity\n{}\n```", d.signature_text());
         if let Some(doc) = &d.doc {
-            let doc = doc.trim();
-            if !doc.is_empty() {
+            let natspec = format_natspec(doc);
+            if !natspec.is_empty() {
                 md.push_str("\n\n");
-                md.push_str(doc);
+                md.push_str(&natspec);
             }
         }
         Some(md)
@@ -975,6 +975,66 @@ fn documentation(map: &Map<String, Value>) -> Option<String> {
     }
 }
 
+/// Render solc's raw NatSpec text as readable Markdown. solc strips the comment
+/// markers but joins lines with single newlines, which Markdown collapses — so
+/// `@notice`/`@param`/`@return` would otherwise run together on one line with
+/// the tags shown literally. Group each tag's (possibly wrapped) text, and list
+/// the parameters and returns.
+fn format_natspec(doc: &str) -> String {
+    // A line beginning with `@` starts a new tag entry; any other non-empty line
+    // continues the previous entry's text (NatSpec wraps long descriptions).
+    let mut entries: Vec<(Option<String>, String)> = Vec::new();
+    for raw in doc.lines() {
+        let line = raw.trim().trim_start_matches('*').trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('@') {
+            let (tag, text) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+            entries.push((Some(tag.to_string()), text.trim().to_string()));
+        } else if let Some(last) = entries.last_mut() {
+            last.1.push(' ');
+            last.1.push_str(line);
+        } else {
+            entries.push((None, line.to_string()));
+        }
+    }
+
+    let mut body: Vec<String> = Vec::new();
+    let mut params: Vec<String> = Vec::new();
+    let mut returns: Vec<String> = Vec::new();
+    for (tag, text) in entries {
+        match tag.as_deref() {
+            None | Some("notice") => body.push(text),
+            Some("dev") => body.push(format!("*{text}*")),
+            Some("param") => {
+                let (name, desc) = text.split_once(char::is_whitespace).unwrap_or((text.as_str(), ""));
+                let desc = desc.trim();
+                params.push(if desc.is_empty() {
+                    format!("- `{name}`")
+                } else {
+                    format!("- `{name}` — {desc}")
+                });
+            }
+            Some("return") => returns.push(format!("- {text}")),
+            Some("inheritdoc") => {} // points at another decl; nothing to render
+            Some(other) => body.push(format!("**{other}** {text}")),
+        }
+    }
+
+    let mut out = body.join("\n\n");
+    for (heading, items) in [("Parameters", params), ("Returns", returns)] {
+        if items.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&format!("**{heading}**\n\n{}", items.join("\n")));
+    }
+    out
+}
+
 /// Parse a solc `start:length:index` location, returning `(start, length)` when
 /// the length is present (>= 0).
 fn parse_src(s: &str) -> Option<(usize, usize)> {
@@ -993,6 +1053,19 @@ mod tests {
         assert_eq!(parse_src("12:5:0"), Some((12, 5)));
         assert_eq!(parse_src("12:-1:-1"), None);
         assert_eq!(parse_src("bad"), None);
+    }
+
+    #[test]
+    fn natspec_formats_tags_and_wraps() {
+        let doc = "@notice Transfers tokens\nto a recipient\n@param to the recipient\n@param amount how much\n@return success whether it worked";
+        let md = format_natspec(doc);
+        // Wrapped @notice text is rejoined, not collapsed onto the next tag.
+        assert!(md.contains("Transfers tokens to a recipient"), "{md}");
+        assert!(md.contains("**Parameters**"), "{md}");
+        assert!(md.contains("- `to` — the recipient"), "{md}");
+        assert!(md.contains("- `amount` — how much"), "{md}");
+        assert!(md.contains("**Returns**"), "{md}");
+        assert!(md.contains("- success whether it worked"), "{md}");
     }
 
     #[test]
