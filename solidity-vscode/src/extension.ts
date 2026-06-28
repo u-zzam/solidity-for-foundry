@@ -1,6 +1,7 @@
 import {
   workspace,
   window,
+  commands,
   ExtensionContext,
   ProgressLocation,
 } from "vscode";
@@ -130,7 +131,29 @@ async function ensureServer(
   }
 }
 
-export async function activate(context: ExtensionContext): Promise<void> {
+function newClient(command: string): LanguageClient {
+  const run: Executable = { command };
+  const serverOptions: ServerOptions = { run, debug: run };
+  const clientOptions: LanguageClientOptions = {
+    documentSelector: [{ scheme: "file", language: "solidity" }],
+    synchronize: {
+      fileEvents: workspace.createFileSystemWatcher("**/*.sol"),
+    },
+  };
+  return new LanguageClient(
+    "solidity",
+    "Solidity for Foundry",
+    serverOptions,
+    clientOptions,
+  );
+}
+
+/// Resolve the server command (an explicit solidity.serverPath, else the
+/// downloaded release binary), then create and start the client. Recreating the
+/// client each time — rather than client.restart() — is what lets an edited
+/// serverPath take effect, since ServerOptions captures the command at
+/// construction.
+async function startClient(context: ExtensionContext): Promise<void> {
   const configured = workspace
     .getConfiguration("solidity")
     .get<string>("serverPath")
@@ -142,24 +165,18 @@ export async function activate(context: ExtensionContext): Promise<void> {
   if (!command) {
     return;
   }
+  client = newClient(command);
+  await client.start();
+}
 
-  const run: Executable = { command };
-  const serverOptions: ServerOptions = { run, debug: run };
-
-  const clientOptions: LanguageClientOptions = {
-    documentSelector: [{ scheme: "file", language: "solidity" }],
-    synchronize: {
-      fileEvents: workspace.createFileSystemWatcher("**/*.sol"),
-    },
-  };
-
-  client = new LanguageClient(
-    "solidity",
-    "Solidity for Foundry",
-    serverOptions,
-    clientOptions,
+export async function activate(context: ExtensionContext): Promise<void> {
+  context.subscriptions.push(
+    commands.registerCommand("solidity.restartServer", async () => {
+      await client?.stop();
+      await startClient(context);
+    }),
   );
-  client.start();
+  await startClient(context);
 }
 
 export function deactivate(): Thenable<void> | undefined {

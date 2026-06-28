@@ -26,6 +26,13 @@
         "path": "./syntaxes/solidity.tmLanguage.json"
       }
     ],
+    "commands": [
+      {
+        "command": "solidity.restartServer",
+        "title": "Restart Server",
+        "category": "Solidity"
+      }
+    ],
     "configuration": {
       "title": "Solidity for Foundry",
       "properties": {
