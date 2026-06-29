@@ -144,6 +144,13 @@ function newClient(command: string): LanguageClient {
         "**/{*.sol,foundry.toml,remappings.txt}",
       ),
     },
+    initializationOptions: {
+      experimental: {
+        inlayHints: workspace
+          .getConfiguration("solidity")
+          .get<boolean>("experimental.inlayHints", true),
+      },
+    },
   };
   return new LanguageClient(
     "solidity",
@@ -181,11 +188,14 @@ export async function activate(context: ExtensionContext): Promise<void> {
       await startClient(context);
     }),
     workspace.onDidChangeConfiguration(async (e) => {
-      if (!e.affectsConfiguration("solidity.serverPath")) {
+      if (
+        !e.affectsConfiguration("solidity.serverPath") &&
+        !e.affectsConfiguration("solidity.experimental.inlayHints")
+      ) {
         return;
       }
       const pick = await window.showInformationMessage(
-        "solidity.serverPath changed — restart the Solidity server to apply it.",
+        "Solidity setting changed — restart the server to apply it.",
         "Restart",
       );
       if (pick === "Restart") {

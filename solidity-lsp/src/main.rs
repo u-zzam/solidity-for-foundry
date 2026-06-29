@@ -397,7 +397,18 @@ impl Backend {
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
-    async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        // Experimental: a client may turn off call-site inlay hints via
+        // `initializationOptions: { experimental: { inlayHints: false } }`. When
+        // off we simply don't advertise the provider, so the editor never asks.
+        // Default on. Toggling takes effect on the next server start.
+        let inlay_hints = params
+            .initialization_options
+            .as_ref()
+            .and_then(|o| o.get("experimental"))
+            .and_then(|e| e.get("inlayHints"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
                 name: "solidity-for-foundry-lsp".into(),
@@ -429,7 +440,7 @@ impl LanguageServer for Backend {
                     ..Default::default()
                 }),
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
-                inlay_hint_provider: Some(OneOf::Left(true)),
+                inlay_hint_provider: inlay_hints.then_some(OneOf::Left(true)),
                 semantic_tokens_provider: Some(
                     SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
                         legend: SemanticTokensLegend {

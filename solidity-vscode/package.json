@@ -46,6 +46,11 @@
           "enum": ["off", "messages", "verbose"],
           "default": "off",
           "description": "Trace the communication between VS Code and the Solidity language server, shown in the server's output channel."
+        },
+        "solidity.experimental.inlayHints": {
+          "type": "boolean",
+          "default": true,
+          "description": "(Experimental) Show call-site parameter-name inlay hints in Solidity files. Takes effect after the server restarts."
         }
       }
     }
