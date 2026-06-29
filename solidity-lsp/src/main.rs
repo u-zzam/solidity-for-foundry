@@ -486,6 +486,11 @@ impl LanguageServer for Backend {
         }
         // Live parser fallback (cold start, mid-edit, or no foundry.toml).
         let parsed = self.state.parsed.read().await;
+        // An import path opens the imported file; relative paths resolve here even
+        // without an index (remapped ones come from the index above).
+        if let Some(loc) = parse::import_definition(parsed.get(&uri), &uri, p.position) {
+            return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
+        }
         let locs = parse::definition(&parsed, &uri, p.position);
         Ok((!locs.is_empty()).then_some(GotoDefinitionResponse::Array(locs)))
     }

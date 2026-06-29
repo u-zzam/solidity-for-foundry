@@ -161,12 +161,22 @@ struct Arg {
     ident: Option<String>,
 }
 
+/// An import path literal and the span of the quoted string, so clicking the
+/// path can open the imported file.
+struct ImportPath {
+    /// The path as written, without the surrounding quotes (`./X.sol`).
+    path: String,
+    start: usize,
+    end: usize,
+}
+
 /// A single parsed buffer.
 pub struct File {
     pub text: String,
     defs: Vec<Def>,
     idents: Vec<Ident>,
     calls: Vec<Call>,
+    imports: Vec<ImportPath>,
 }
 
 thread_local! {
@@ -187,9 +197,10 @@ pub fn parse(text: &str) -> File {
     let mut defs = Vec::new();
     let mut idents = Vec::new();
     let mut calls = Vec::new();
+    let mut imports = Vec::new();
     if let Some(tree) = tree {
         let src = text.as_bytes();
-        walk(tree.root_node(), src, None, &mut defs, &mut idents, &mut calls);
+        walk(tree.root_node(), src, None, &mut defs, &mut idents, &mut calls, &mut imports);
         // Mark identifier occurrences that coincide with a declaration's name.
         let def_spans: HashSet<(usize, usize)> =
             defs.iter().map(|d| (d.name_start, d.name_end)).collect();
@@ -197,7 +208,7 @@ pub fn parse(text: &str) -> File {
             id.is_def = def_spans.contains(&(id.start, id.end));
         }
     }
-    File { text: text.to_string(), defs, idents, calls }
+    File { text: text.to_string(), defs, idents, calls, imports }
 }
 
 /// Recursive traversal: record declarations (carrying their enclosing type
@@ -209,7 +220,23 @@ fn walk<'a>(
     defs: &mut Vec<Def>,
     idents: &mut Vec<Ident>,
     calls: &mut Vec<Call>,
+    imports: &mut Vec<ImportPath>,
 ) {
+    // Import path: record the quoted source so clicking it can open the file.
+    // Descend anyway — a named import (`import {X} from …`) has identifiers we
+    // still want indexed.
+    if node.kind() == "import_directive" {
+        if let Some(s) = node.child_by_field_name("source") {
+            if let Ok(raw) = s.utf8_text(src) {
+                imports.push(ImportPath {
+                    path: raw.trim_matches(['"', '\'']).to_string(),
+                    start: s.start_byte(),
+                    end: s.end_byte(),
+                });
+            }
+        }
+    }
+
     if matches!(node.kind(), "identifier" | "enum_value") {
         if let Ok(name) = node.utf8_text(src) {
             idents.push(Ident {
@@ -250,14 +277,14 @@ fn walk<'a>(
         let child_container = inner.as_deref().or(container);
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
-            walk(child, src, child_container, defs, idents, calls);
+            walk(child, src, child_container, defs, idents, calls, imports);
         }
         return;
     }
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        walk(child, src, container, defs, idents, calls);
+        walk(child, src, container, defs, idents, calls, imports);
     }
 }
 
@@ -467,6 +494,23 @@ fn ident_at(file: &File, offset: usize) -> Option<&Ident> {
 fn location(uri: &Url, text: &str, start: usize, end: usize) -> Location {
     let m = PositionMapper::new(text);
     Location::new(uri.clone(), Range::new(m.position(start), m.position(end)))
+}
+
+/// Go-to-definition on an import path literal: open the imported file. Resolves
+/// only relative paths (`./`, `../`), which are pure filesystem lookups; remapped
+/// paths (`@oz/…`) need solc's resolution and are served from the index. Returns
+/// `None` when the cursor is not on a path or the target file does not exist.
+pub fn import_definition(file: Option<&File>, uri: &Url, pos: Position) -> Option<Location> {
+    let file = file?;
+    let offset = PositionMapper::new(&file.text).offset(pos);
+    let imp = file.imports.iter().find(|i| i.start <= offset && offset <= i.end)?;
+    if !imp.path.starts_with('.') {
+        return None;
+    }
+    let dir = uri.to_file_path().ok()?;
+    let target = std::fs::canonicalize(dir.parent()?.join(&imp.path)).ok()?;
+    let top = Position::new(0, 0);
+    Some(Location::new(Url::from_file_path(target).ok()?, Range::new(top, top)))
 }
 
 /// Go-to-definition by name: declarations named like the identifier under the
@@ -929,6 +973,37 @@ contract Token is Base {
         for m in ["f", "p", "baseFn", "baseVar"] {
             assert!(token.contains(&m.to_string()), "missing {m}: {token:?}");
         }
+    }
+
+    #[test]
+    fn import_path_opens_the_relative_file() {
+        // A sibling file on disk; clicking inside the import path resolves to it.
+        let dir = std::env::temp_dir().join(format!("sfi-import-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let b = dir.join("B.sol");
+        std::fs::write(&b, "contract B {}").unwrap();
+
+        let src = "import { Token } from \"./B.sol\";\ncontract A {}";
+        let file = parse(src);
+        // The path literal (sans quotes) was recorded.
+        assert_eq!(file.imports.len(), 1, "import not recorded");
+        assert_eq!(file.imports[0].path, "./B.sol");
+
+        let uri = Url::from_file_path(dir.join("A.sol")).unwrap();
+        let mut files = HashMap::new();
+        files.insert(uri.clone(), file);
+
+        // Cursor on the path string jumps to the top of B.sol.
+        let at = pos_of(src, "B.sol");
+        let loc = import_definition(files.get(&uri), &uri, at).unwrap();
+        let want = Url::from_file_path(std::fs::canonicalize(&b).unwrap()).unwrap();
+        assert_eq!(loc.uri, want);
+        assert_eq!(loc.range.start, Position::new(0, 0));
+
+        // The imported symbol (`Token`) is not a path — name-based def handles it.
+        assert!(import_definition(files.get(&uri), &uri, pos_of(src, "Token }")).is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

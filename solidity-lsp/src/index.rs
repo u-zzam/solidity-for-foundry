@@ -83,6 +83,9 @@ struct FileEntry {
     text: String,
     /// Clickable spans (references + declaration names) mapping to a declaration.
     spans: Vec<Span>,
+    /// Clickable import-path literals mapping to the imported file's source slot,
+    /// so go-to-definition on `"./X.sol"` (relative or remapped) opens that file.
+    imports: Vec<ImportSpan>,
     symbols: Vec<DocumentSymbol>,
     /// Pre-resolved call-site parameter-name inlay hints (position + label).
     hints: Vec<(Position, String)>,
@@ -94,6 +97,15 @@ struct Span {
     start: usize,
     end: usize,
     decl: i64,
+}
+
+/// An import path literal (`"./X.sol"`, `"@oz/Token.sol"`) and the source slot of
+/// the file it resolves to — solc already applied remappings, so the target is
+/// the `src_index` of the `sourceUnit` it imports.
+struct ImportSpan {
+    start: usize,
+    end: usize,
+    target: usize,
 }
 
 /// A call argument awaiting its callee's parameter name (resolved after the
@@ -145,6 +157,14 @@ impl Index {
         let mut top_level: HashSet<i64> = HashSet::new();
         let mut impls: HashMap<i64, Vec<i64>> = HashMap::new();
 
+        // Each `ImportDirective.sourceUnit` is the imported file's SourceUnit node
+        // id; map every source unit's root id to its slot so an import resolves to
+        // the file it pulls in (an import may target a file processed later).
+        let sourceunit_to_index: HashMap<i64, usize> = sources
+            .iter()
+            .filter_map(|s| Some((s.ast.get("id").and_then(|v| v.as_i64())?, s.index)))
+            .collect();
+
         for s in sources {
             let Ok(text) = std::fs::read_to_string(&s.path) else {
                 continue;
@@ -159,7 +179,20 @@ impl Index {
             let symbols = doc_symbols(&s.ast, &mapper);
 
             let mut spans = Vec::new();
+            let mut imports = Vec::new();
             walk(&s.ast, &mut |map| {
+                // Import directive: make its path literal jump to the imported
+                // file. solc resolved the path (remappings included) to a
+                // `sourceUnit`, so we only map that to its source slot.
+                if gets(map, "nodeType") == Some("ImportDirective") {
+                    if let (Some((start, end)), Some(&target)) = (
+                        gets(map, "src").and_then(|src| quoted_span(&text, src)),
+                        geti(map, "sourceUnit").and_then(|su| sourceunit_to_index.get(&su)),
+                    ) {
+                        imports.push(ImportSpan { start, end, target });
+                    }
+                    return;
+                }
                 // Declaration: has a name location.
                 if let (Some(id), Some(name), Some((start, len))) = (
                     geti(map, "id"),
@@ -243,7 +276,15 @@ impl Index {
             }
             files.insert(
                 s.index,
-                FileEntry { uri, text, spans, symbols, hints: Vec::new(), tokens: Vec::new() },
+                FileEntry {
+                    uri,
+                    text,
+                    spans,
+                    imports,
+                    symbols,
+                    hints: Vec::new(),
+                    tokens: Vec::new(),
+                },
             );
         }
 
@@ -384,8 +425,15 @@ impl Index {
     }
 
     pub fn definition(&self, path: &Path, pos: Position) -> Option<Location> {
-        let id = self.resolve(path, pos)?;
-        self.decl_location(id)
+        if let Some(loc) = self.resolve(path, pos).and_then(|id| self.decl_location(id)) {
+            return Some(loc);
+        }
+        // Not on a symbol — maybe on an import path literal, which jumps to the
+        // top of the imported file.
+        let f = self.slot_for(path).and_then(|i| self.files.get(&i))?;
+        let offset = PositionMapper::new(&f.text).offset(pos);
+        let imp = f.imports.iter().find(|i| i.start <= offset && offset < i.end)?;
+        self.location(imp.target, 0, 0)
     }
 
     pub fn references(&self, path: &Path, pos: Position, include_decl: bool) -> Vec<Location> {
@@ -1035,6 +1083,17 @@ fn format_natspec(doc: &str) -> String {
     out
 }
 
+/// The byte span (quotes included) of the path literal inside an import
+/// statement whose solc `src` location is `src`. solc gives no separate location
+/// for the path string, so scan the statement text for its first quoted run.
+fn quoted_span(text: &str, src: &str) -> Option<(usize, usize)> {
+    let (start, len) = parse_src(src)?;
+    let region = text.get(start..(start + len).min(text.len()))?.as_bytes();
+    let open = region.iter().position(|&c| c == b'"' || c == b'\'')?;
+    let close = region[open + 1..].iter().position(|&c| c == region[open])?;
+    Some((start + open, start + open + close + 2))
+}
+
 /// Parse a solc `start:length:index` location, returning `(start, length)` when
 /// the length is present (>= 0).
 fn parse_src(s: &str) -> Option<(usize, usize)> {
@@ -1053,6 +1112,19 @@ mod tests {
         assert_eq!(parse_src("12:5:0"), Some((12, 5)));
         assert_eq!(parse_src("12:-1:-1"), None);
         assert_eq!(parse_src("bad"), None);
+    }
+
+    #[test]
+    fn quoted_span_isolates_the_import_path() {
+        let t = "import { Token } from \"@oz/Token.sol\";";
+        let (s, e) = quoted_span(t, &format!("0:{}:1", t.len())).unwrap();
+        assert_eq!(&t[s..e], "\"@oz/Token.sol\"");
+        // Single quotes and a bare import both work.
+        let t = "import './B.sol';";
+        let (s, e) = quoted_span(t, &format!("0:{}:1", t.len())).unwrap();
+        assert_eq!(&t[s..e], "'./B.sol'");
+        // No quoted run (not an import) yields nothing.
+        assert_eq!(quoted_span("contract A {}", "0:13:1"), None);
     }
 
     #[test]
