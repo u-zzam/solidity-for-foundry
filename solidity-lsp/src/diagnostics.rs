@@ -7,7 +7,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use foundry_compilers::artifacts::{Error as SolcError, Severity};
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range, Url};
+use tower_lsp::lsp_types::{
+    Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, Location, NumberOrString, Position,
+    Range, Url,
+};
 
 use crate::project::LintFinding;
 
@@ -92,18 +95,38 @@ fn severity(s: Severity) -> DiagnosticSeverity {
 
 /// Build an LSP diagnostic for `err`, positioned via `mapper` (the file the
 /// error points into). The caller supplies the matching source text.
-pub fn to_diagnostic(err: &SolcError, mapper: &PositionMapper) -> Diagnostic {
+pub fn to_diagnostic(err: &SolcError, mapper: &PositionMapper, uri: &Url) -> Diagnostic {
     let range = err
         .source_location
         .as_ref()
         .map(|l| mapper.range(l.start, l.end))
         .unwrap_or_default();
+    // Secondary locations in the *same* file as the primary error become
+    // relatedInformation (e.g. "Identifier already declared" -> the earlier
+    // declaration; an override/shadow -> the base) so the editor offers a jump.
+    // `mapper`/`uri` only apply to the primary file, so cross-file secondaries
+    // are dropped rather than mispositioned.
+    let primary_file = err.source_location.as_ref().map(|l| l.file.as_str());
+    let related: Vec<DiagnosticRelatedInformation> = err
+        .secondary_source_locations
+        .iter()
+        .filter_map(|s| {
+            if s.file.as_deref() != primary_file {
+                return None;
+            }
+            Some(DiagnosticRelatedInformation {
+                location: Location::new(uri.clone(), mapper.range(s.start?, s.end?)),
+                message: s.message.clone().unwrap_or_default(),
+            })
+        })
+        .collect();
     Diagnostic {
         range,
         severity: Some(severity(err.severity)),
         code: err.error_code.map(|c| NumberOrString::Number(c as i32)),
         source: Some("solc".to_string()),
         message: err.message.trim().to_string(),
+        related_information: (!related.is_empty()).then_some(related),
         ..Default::default()
     }
 }
@@ -136,7 +159,8 @@ pub fn group(errors: &[SolcError], root: &Path, fallback: &Url) -> HashMap<Url, 
             .and_then(|o| o.as_deref())
             .unwrap_or("");
         let mapper = PositionMapper::new(text);
-        out.entry(uri).or_default().push(to_diagnostic(err, &mapper));
+        let diag = to_diagnostic(err, &mapper, &uri);
+        out.entry(uri).or_default().push(diag);
     }
     out
 }
@@ -158,7 +182,7 @@ pub fn for_buffer(errors: &[SolcError], root: &Path, target: &Url, buffer: &str)
                 Url::from_file_path(root.join(&loc.file)).ok().is_some_and(|uri| uri == *target)
             }
         })
-        .map(|err| to_diagnostic(err, &mapper))
+        .map(|err| to_diagnostic(err, &mapper, target))
         .collect()
 }
 
@@ -272,6 +296,32 @@ mod tests {
             let pos = m.position(byte);
             assert_eq!(m.offset(pos), byte, "byte {byte} via {pos:?}");
         }
+    }
+
+    #[test]
+    fn diagnostic_carries_same_file_related_info() {
+        let json = serde_json::json!({
+            "type": "DeclarationError",
+            "component": "general",
+            "severity": "error",
+            "errorCode": "2333",
+            "message": "Identifier already declared.",
+            "sourceLocation": { "file": "A.sol", "start": 20, "end": 25 },
+            "secondarySourceLocations": [
+                { "file": "A.sol", "start": 5, "end": 10, "message": "The previous declaration is here:" },
+                { "file": "B.sol", "start": 0, "end": 3, "message": "elsewhere" }
+            ]
+        });
+        let err: SolcError = serde_json::from_value(json).unwrap();
+        let mapper = PositionMapper::new("contract A { uint x; uint x; }");
+        let uri = Url::parse("file:///A.sol").unwrap();
+        let related = to_diagnostic(&err, &mapper, &uri)
+            .related_information
+            .expect("a same-file secondary location yields related information");
+        // The cross-file (B.sol) secondary is dropped; only the same-file one stays.
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].message, "The previous declaration is here:");
+        assert_eq!(related[0].location.uri, uri);
     }
 
     #[test]
