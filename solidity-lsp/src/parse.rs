@@ -127,6 +127,13 @@ struct Def {
     /// Ordered parameter names for callables/structs, for call-site inlay hints.
     /// Empty for non-callables; an unnamed parameter is an empty string.
     params: Vec<String>,
+    /// For a variable/parameter/field of a user-defined type, that type's name,
+    /// so `<var>.` can complete the type's members. `None` for elementary types,
+    /// mappings and arrays.
+    type_name: Option<String>,
+    /// For a contract/interface, the names it inherits from, so member completion
+    /// can include inherited members.
+    bases: Vec<String>,
 }
 
 /// One identifier occurrence (declaration site or reference), for cursor
@@ -235,6 +242,8 @@ fn walk<'a>(
             container: container.map(str::to_string),
             detail,
             params: param_names(node, src),
+            type_name: var_type_name(node, src),
+            bases: base_names(node, src),
         });
         // Descend with this node as the container if it is a type scope.
         let inner = kind.is_container().then_some(name);
@@ -336,6 +345,63 @@ fn inner_expr(mut node: Node) -> Node {
         }
     }
     node
+}
+
+/// The user-defined type of a variable/parameter/field, so `<var>.` can complete
+/// that type's members. `None` for elementary types, mappings and arrays — which
+/// have no single container of members.
+fn var_type_name(node: Node, src: &[u8]) -> Option<String> {
+    if !matches!(
+        node.kind(),
+        "variable_declaration"
+            | "state_variable_declaration"
+            | "constant_variable_declaration"
+            | "parameter"
+            | "struct_member"
+            | "event_parameter"
+            | "error_parameter"
+    ) {
+        return None;
+    }
+    let type_field = node.child_by_field_name("type")?;
+    // A plain user type's `type_name` wraps a `user_defined_type`; a primitive,
+    // mapping or array wraps something else and yields no member container.
+    let mut cursor = type_field.walk();
+    let first = type_field.named_children(&mut cursor).next()?;
+    (first.kind() == "user_defined_type")
+        .then(|| last_identifier(first, src))
+        .flatten()
+}
+
+/// The names a contract/interface inherits from (each `inheritance_specifier`'s
+/// `ancestor`), for walking inherited members.
+fn base_names(node: Node, src: &[u8]) -> Vec<String> {
+    if !matches!(node.kind(), "contract_declaration" | "interface_declaration") {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() != "inheritance_specifier" {
+            continue;
+        }
+        if let Some(name) =
+            child.child_by_field_name("ancestor").and_then(|a| last_identifier(a, src))
+        {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// The last `identifier` under a node (`A.B` qualified type -> `B`).
+fn last_identifier(node: Node, src: &[u8]) -> Option<String> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|n| n.kind() == "identifier")
+        .last()
+        .and_then(|id| id.utf8_text(src).ok())
+        .map(String::from)
 }
 
 /// The callee name of a call: a bare `identifier`, or the rightmost name of a
@@ -566,16 +632,65 @@ pub fn workspace_symbols(files: &HashMap<Url, File>, query: &str) -> Vec<SymbolI
     out
 }
 
-/// Members of a named container (`Lib.` / `Contract.` / struct / enum), deduped.
+/// Members for `<container>.` completion. `container` may be an instance (a
+/// variable/parameter/field), which resolves to its declared type, or a type /
+/// contract / library / struct / enum name used directly. Inherited members are
+/// included by walking base contracts; a derived member shadows a base's.
 pub fn member_completions(files: &HashMap<Url, File>, container: &str) -> Vec<CompletionItem> {
-    let mut seen = HashSet::new();
-    files
+    // Resolve an instance to its declared type; otherwise use the name directly.
+    let target = files
         .values()
         .flat_map(|f| f.defs.iter())
-        .filter(|d| d.container.as_deref() == Some(container) && d.kind.is_member())
-        .filter(|d| seen.insert(d.name.clone()))
-        .map(completion_for)
-        .collect()
+        .find(|d| {
+            d.name == container
+                && d.type_name.is_some()
+                && matches!(
+                    d.kind,
+                    DefKind::StateVar | DefKind::Local | DefKind::Param | DefKind::Field
+                )
+        })
+        .and_then(|d| d.type_name.clone())
+        .unwrap_or_else(|| container.to_string());
+
+    // Inheritance edges by type name.
+    let mut bases: HashMap<&str, &[String]> = HashMap::new();
+    for d in files.values().flat_map(|f| f.defs.iter()) {
+        if !d.bases.is_empty() {
+            bases.insert(d.name.as_str(), &d.bases);
+        }
+    }
+
+    // The target type then its bases, breadth-first (most-derived first).
+    let mut order = Vec::new();
+    let mut queued: HashSet<String> = HashSet::new();
+    let mut queue = std::collections::VecDeque::new();
+    queued.insert(target.clone());
+    queue.push_back(target);
+    while let Some(name) = queue.pop_front() {
+        if let Some(bs) = bases.get(name.as_str()) {
+            for b in *bs {
+                if queued.insert(b.clone()) {
+                    queue.push_back(b.clone());
+                }
+            }
+        }
+        order.push(name);
+    }
+
+    // Members of each type in order, deduped so a derived member shadows a base's.
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for name in &order {
+        for d in files.values().flat_map(|f| f.defs.iter()) {
+            if d.container.as_deref() == Some(name.as_str())
+                && d.kind.is_member()
+                && seen.insert(d.name.clone())
+            {
+                out.push(completion_for(d));
+            }
+        }
+    }
+    out
 }
 
 /// Top-level / contract-level names across all buffers, deduped, for bare
@@ -779,6 +894,41 @@ contract Counter {
         assert!(labels.contains(&"a:".to_string()), "{labels:?}");
         assert!(labels.contains(&"b:".to_string()), "{labels:?}");
         assert!(labels.contains(&"newCount:".to_string()), "{labels:?}");
+    }
+
+    #[test]
+    fn member_completion_resolves_instance_type_and_inheritance() {
+        const SRC: &str = r#"
+struct Point { uint256 x; uint256 y; }
+
+contract Base {
+    uint256 public baseVar;
+    function baseFn() public {}
+}
+
+contract Token is Base {
+    Point public p;
+    function f(Point memory pt) public {
+        uint256 z = pt.x;
+    }
+}
+"#;
+        let uri = Url::parse("file:///T.sol").unwrap();
+        let mut files = HashMap::new();
+        files.insert(uri, parse(SRC));
+        let labels = |v: &[CompletionItem]| v.iter().map(|i| i.label.clone()).collect::<Vec<_>>();
+
+        // A parameter of struct type completes that struct's fields.
+        let pt = labels(&member_completions(&files, "pt"));
+        assert!(pt.contains(&"x".to_string()), "{pt:?}");
+        assert!(pt.contains(&"y".to_string()), "{pt:?}");
+        // A state variable of struct type, likewise.
+        assert!(labels(&member_completions(&files, "p")).contains(&"x".to_string()));
+        // A contract name lists its own and inherited members.
+        let token = labels(&member_completions(&files, "Token"));
+        for m in ["f", "p", "baseFn", "baseVar"] {
+            assert!(token.contains(&m.to_string()), "missing {m}: {token:?}");
+        }
     }
 
     #[test]
