@@ -801,6 +801,15 @@ impl Backend {
         let base = root.unwrap_or_else(|| path.parent().unwrap_or(&path).to_path_buf());
         let diags = diagnostics::for_buffer(&errors, &base, &uri, &buffer);
         let mut published = self.state.published.lock().await;
+        // Re-check under the published lock that the buffer is still open and
+        // unchanged. did_close removes the doc and publishes an empty set outside
+        // this lock, so without re-checking here an in-flight check could land its
+        // publish *after* that clear — leaving a ghost squiggle on a closed file
+        // that the warm-cache clear loop can never take back. (The check before
+        // the solc run only skips wasted work; this one is the correctness guard.)
+        if self.state.docs.read().await.get(&uri) != Some(&buffer) {
+            return;
+        }
         if diags.is_empty() {
             published.remove(&uri);
         } else {
