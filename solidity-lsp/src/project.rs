@@ -265,9 +265,8 @@ fn glob_match(pat: &str, path: &str) -> bool {
     glob_match_bytes(pat.as_bytes(), path.as_bytes())
 }
 
-// ponytail: naive backtracking matcher, O(n^stars) worst case — skip globs are
-// short and few, so it is never hot; reach for the `globset` crate if that ever
-// changes.
+// Naive backtracking matcher, O(n^stars) worst case — skip globs are short and
+// few, so it is never hot; reach for the `globset` crate if that ever changes.
 fn glob_match_bytes(p: &[u8], t: &[u8]) -> bool {
     if p.is_empty() {
         return t.is_empty();
