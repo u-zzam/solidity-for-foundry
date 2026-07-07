@@ -843,10 +843,16 @@ impl LanguageServer for Backend {
         if let Some(root) = self.valid_index_root(&uri).await {
             if let Ok(path) = uri.to_file_path() {
                 let guard = self.state.index.read().await;
-                if let Some(range) =
-                    guard.get(&root).and_then(|idx| idx.rename_range(&path, params.position))
-                {
-                    return Ok(Some(PrepareRenameResponse::Range(range)));
+                if let Some(idx) = guard.get(&root) {
+                    // Don't offer rename for a symbol declared in a dependency.
+                    let vendored = idx
+                        .declaration_path(&path, params.position)
+                        .is_some_and(|d| under_libs(&root, &d));
+                    if !vendored {
+                        if let Some(range) = idx.rename_range(&path, params.position) {
+                            return Ok(Some(PrepareRenameResponse::Range(range)));
+                        }
+                    }
                 }
             }
         }
@@ -873,6 +879,12 @@ impl LanguageServer for Backend {
         let Some(idx) = guard.get(&root) else {
             return Ok(None);
         };
+        // Refuse to edit vendored dependency sources under the project's libs.
+        if idx.declaration_path(&path, p.position).is_some_and(|d| under_libs(&root, &d)) {
+            return Err(tower_lsp::jsonrpc::Error::invalid_params(
+                "cannot rename a symbol declared in a library dependency".to_string(),
+            ));
+        }
         Ok(idx.rename(&path, p.position, &params.new_name))
     }
 
@@ -1106,6 +1118,15 @@ fn valid_new_name(name: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// Whether `decl_path` lives under one of `root`'s library directories — a
+/// vendored dependency source a rename must not silently edit.
+fn under_libs(root: &Path, decl_path: &Path) -> bool {
+    project::lib_dirs(root).iter().any(|lib| {
+        let lib = std::fs::canonicalize(lib).unwrap_or_else(|_| lib.clone());
+        decl_path.starts_with(&lib)
+    })
+}
+
 /// If the cursor is completing `<ident>.<partial>`, return `<ident>`.
 fn member_context(text: &str, offset: usize) -> Option<String> {
     let b = text.as_bytes();
@@ -1191,10 +1212,19 @@ async fn main() {
 mod tests {
     use super::{
         call_context, header_edit, import_line, member_context, pragma_from_message,
-        relative_import, valid_new_name,
+        relative_import, under_libs, valid_new_name,
     };
     use std::path::Path;
     use tower_lsp::lsp_types::Position;
+
+    #[test]
+    fn rename_refuses_library_sources() {
+        // Default libs is `lib`: a declaration there is a vendored dependency and
+        // must not be renamed; project sources are fine.
+        let root = Path::new("/proj");
+        assert!(under_libs(root, Path::new("/proj/lib/oz/contracts/Ownable.sol")));
+        assert!(!under_libs(root, Path::new("/proj/src/MyToken.sol")));
+    }
 
     #[test]
     fn rename_target_validation() {

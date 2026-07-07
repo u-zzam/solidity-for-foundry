@@ -402,6 +402,14 @@ impl Index {
         })
     }
 
+    /// The file that declares the symbol under the cursor, if it resolves — so a
+    /// rename can refuse to edit declarations that live in a vendored dependency.
+    pub fn declaration_path(&self, path: &Path, pos: Position) -> Option<PathBuf> {
+        let id = self.resolve(path, pos)?;
+        let d = self.decls.get(&id)?;
+        self.files.get(&d.src_index)?.uri.to_file_path().ok()
+    }
+
     /// Files declaring a top-level symbol named `name`, for import suggestions.
     pub fn import_candidates(&self, name: &str) -> Vec<PathBuf> {
         let mut out: Vec<PathBuf> = Vec::new();

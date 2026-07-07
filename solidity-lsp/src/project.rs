@@ -483,6 +483,12 @@ pub fn check_buffer(root: &Path, target: &Path, buffer: &str) -> Result<Vec<Solc
     Ok(filter_errors(output.errors, root, &cfg))
 }
 
+/// The project's configured library directories (absolute), where vendored
+/// dependency sources live. Rename refuses to edit declarations under these.
+pub fn lib_dirs(root: &Path) -> Vec<PathBuf> {
+    parse_config(root).libs.iter().map(|l| root.join(l)).collect()
+}
+
 /// The remapping prefixes configured for a project (e.g. `@openzeppelin/`),
 /// sorted and deduped, for import-path completion.
 pub fn remapping_prefixes(root: &Path) -> Vec<String> {
@@ -557,6 +563,18 @@ mod tests {
         std::fs::write(&outer, "contract X {}").unwrap();
         assert_eq!(locate_root(&outer).as_deref(), Some(root.as_path()));
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn lib_dirs_reflect_config() {
+        let root = temp_dir();
+        // No config: forge's default single `lib` directory.
+        assert_eq!(lib_dirs(&root), vec![root.join("lib")]);
+        // An explicit list replaces the default.
+        std::fs::write(root.join("foundry.toml"), "[profile.default]\nlibs = [\"lib\", \"deps\"]\n")
+            .unwrap();
+        assert_eq!(lib_dirs(&root), vec![root.join("lib"), root.join("deps")]);
         std::fs::remove_dir_all(&root).ok();
     }
 
