@@ -101,6 +101,22 @@ pub fn member_builtins(container: &str) -> Vec<CompletionItem> {
             ("difficulty", "uint256"),
         ],
         "tx" => &[("origin", "address"), ("gasprice", "uint256")],
+        // `bytes`/`string` used as a namespace: `bytes.concat` / `string.concat`.
+        // Typed literally (unlike an `address`/array variable, resolved by type).
+        "bytes" => {
+            return vec![item(
+                "concat",
+                CompletionItemKind::FUNCTION,
+                "bytes.concat(...) returns (bytes memory)",
+            )];
+        }
+        "string" => {
+            return vec![item(
+                "concat",
+                CompletionItemKind::FUNCTION,
+                "string.concat(...) returns (string memory)",
+            )];
+        }
         "abi" => {
             return [
                 ("encode", "abi.encode(...) returns (bytes memory)"),
@@ -117,6 +133,40 @@ pub fn member_builtins(container: &str) -> Vec<CompletionItem> {
         _ => return Vec::new(),
     };
     members.iter().map(|(n, d)| item(n, CompletionItemKind::FIELD, d)).collect()
+}
+
+/// Builtin members of an elementary receiver resolved from a variable's declared
+/// type: `address`/`address payable` members and array (`T[]`) members. The
+/// caller resolves the instance to its type (`address owner;` -> `owner.` passes
+/// `"address"`). Empty for anything else. (`msg`/`block`/`tx`/`abi` and the
+/// `bytes`/`string` namespaces are typed literally and go through
+/// `member_builtins`, not here.)
+pub fn elementary_members(type_name: &str) -> Vec<CompletionItem> {
+    use CompletionItemKind as K;
+    let members: &[(&str, K, &str)] = if type_name.ends_with(']') {
+        // A fixed or dynamic array. `push`/`pop` are storage-only but harmless to
+        // offer; `length` applies to every array.
+        &[
+            ("length", K::FIELD, "uint256"),
+            ("push", K::METHOD, "push(...) — append to a storage array"),
+            ("pop", K::METHOD, "pop() — remove the last element of a storage array"),
+        ]
+    } else {
+        match type_name {
+            "address" | "address payable" => &[
+                ("balance", K::FIELD, "uint256"),
+                ("code", K::FIELD, "bytes memory"),
+                ("codehash", K::FIELD, "bytes32"),
+                ("call", K::METHOD, "call(bytes memory) returns (bool, bytes memory)"),
+                ("delegatecall", K::METHOD, "delegatecall(bytes memory) returns (bool, bytes memory)"),
+                ("staticcall", K::METHOD, "staticcall(bytes memory) returns (bool, bytes memory)"),
+                ("transfer", K::METHOD, "transfer(uint256 amount)"),
+                ("send", K::METHOD, "send(uint256 amount) returns (bool)"),
+            ],
+            _ => return Vec::new(),
+        }
+    };
+    members.iter().map(|(n, k, d)| item(n, *k, d)).collect()
 }
 
 fn snippet(label: &str, body: &str, detail: &str) -> CompletionItem {
@@ -293,6 +343,26 @@ mod tests {
         assert!(member_builtins("block").iter().any(|i| i.label == "timestamp"));
         assert!(member_builtins("tx").iter().any(|i| i.label == "origin"));
         assert!(member_builtins("abi").iter().any(|i| i.label == "encode"));
+        // `bytes`/`string` used as a namespace expose `concat`.
+        assert!(member_builtins("bytes").iter().any(|i| i.label == "concat"));
+        assert!(member_builtins("string").iter().any(|i| i.label == "concat"));
         assert!(member_builtins("Foo").is_empty());
+    }
+
+    #[test]
+    fn elementary_members_cover_address_and_arrays() {
+        let addr = elementary_members("address");
+        for m in
+            ["balance", "code", "codehash", "call", "delegatecall", "staticcall", "transfer", "send"]
+        {
+            assert!(addr.iter().any(|i| i.label == m), "missing {m}");
+        }
+        assert!(elementary_members("address payable").iter().any(|i| i.label == "balance"));
+        let arr = elementary_members("uint256[]");
+        for m in ["length", "push", "pop"] {
+            assert!(arr.iter().any(|i| i.label == m), "missing {m}");
+        }
+        // A user type carries no elementary builtins (its members come from the index/parser).
+        assert!(elementary_members("IERC20").is_empty());
     }
 }

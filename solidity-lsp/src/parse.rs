@@ -404,9 +404,9 @@ fn inner_expr(mut node: Node) -> Node {
     node
 }
 
-/// The user-defined type of a variable/parameter/field, so `<var>.` can complete
-/// that type's members. `None` for elementary types, mappings and arrays — which
-/// have no single container of members.
+/// The type of a variable/parameter/field, so `<var>.` can complete its members:
+/// a user type resolves to its container's members, an `address`/array to the
+/// elementary builtins. `None` for a mapping, which has no member container.
 fn var_type_name(node: Node, src: &[u8]) -> Option<String> {
     if !matches!(
         node.kind(),
@@ -420,14 +420,24 @@ fn var_type_name(node: Node, src: &[u8]) -> Option<String> {
     ) {
         return None;
     }
-    let type_field = node.child_by_field_name("type")?;
-    // A plain user type's `type_name` wraps a `user_defined_type`; a primitive,
-    // mapping or array wraps something else and yields no member container.
+    let type_field = node.child_by_field_name("type")?; // a `type_name`
+    // A mapping has no single container of members.
+    if type_field.child_by_field_name("key_type").is_some() {
+        return None;
+    }
     let mut cursor = type_field.walk();
     let first = type_field.named_children(&mut cursor).next()?;
-    (first.kind() == "user_defined_type")
-        .then(|| last_identifier(first, src))
-        .flatten()
+    match first.kind() {
+        // `Foo` / `A.B` -> the (last) type identifier, for its container's members.
+        "user_defined_type" => last_identifier(first, src),
+        // `address`, `uint256`, `bytes`, ... -> the elementary type name, so
+        // `<var>.` can offer that type's builtins (address balance/call, ...).
+        "primitive_type" => first.utf8_text(src).ok().map(str::to_string),
+        // `T[]` (fixed or dynamic array): the outer `type_name` wraps the element
+        // `type_name`. Keep the written form so the `[]` suffix marks it an array.
+        "type_name" => Some(type_field.utf8_text(src).ok()?.split_whitespace().collect::<String>()),
+        _ => None,
+    }
 }
 
 /// The names a contract/interface inherits from (each `inheritance_specifier`'s
@@ -775,7 +785,7 @@ pub fn member_completions(files: &HashMap<Url, File>, container: &str) -> Vec<Co
     let mut queued: HashSet<String> = HashSet::new();
     let mut queue = std::collections::VecDeque::new();
     queued.insert(target.clone());
-    queue.push_back(target);
+    queue.push_back(target.clone());
     while let Some(name) = queue.pop_front() {
         if let Some(bs) = bases.get(name.as_str()) {
             for b in *bs {
@@ -802,6 +812,9 @@ pub fn member_completions(files: &HashMap<Url, File>, container: &str) -> Vec<Co
             }
         }
     }
+    // An `address`/array receiver has no user container; offer the builtin members
+    // of the resolved elementary type (empty for a user type).
+    out.extend(crate::complete::elementary_members(&target));
     out
 }
 
@@ -1233,6 +1246,34 @@ contract Token is Base {
         for m in ["f", "p", "baseFn", "baseVar"] {
             assert!(token.contains(&m.to_string()), "missing {m}: {token:?}");
         }
+    }
+
+    #[test]
+    fn member_completion_offers_elementary_builtins() {
+        const SRC: &str = r#"
+contract C {
+    address public owner;
+    uint256[] public xs;
+    mapping(address => uint256) public bal;
+}
+"#;
+        let uri = Url::parse("file:///E.sol").unwrap();
+        let mut files = HashMap::new();
+        files.insert(uri, parse(SRC));
+        let labels = |v: &[CompletionItem]| v.iter().map(|i| i.label.clone()).collect::<Vec<_>>();
+
+        // An `address` variable resolves to the address builtins.
+        let owner = labels(&member_completions(&files, "owner"));
+        for m in ["balance", "call", "transfer", "code"] {
+            assert!(owner.contains(&m.to_string()), "missing {m}: {owner:?}");
+        }
+        // An array variable resolves to the array builtins.
+        let xs = labels(&member_completions(&files, "xs"));
+        for m in ["length", "push", "pop"] {
+            assert!(xs.contains(&m.to_string()), "missing {m}: {xs:?}");
+        }
+        // A mapping has no member container, so nothing is offered.
+        assert!(member_completions(&files, "bal").is_empty());
     }
 
     #[test]
