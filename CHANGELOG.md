@@ -10,6 +10,12 @@ breaking change.
 
 ## [Unreleased]
 
+### Fixed
+
+- Suppress solc's "There are more than 256 warnings/errors. Ignoring the rest."
+  truncation notice, which otherwise surfaced as a warning at the top of the
+  open file once a compile exceeded solc's diagnostic cap.
+
 ## [0.3.1] - 2026-07-07
 
 ### Added
