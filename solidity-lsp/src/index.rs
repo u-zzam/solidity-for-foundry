@@ -1401,6 +1401,34 @@ mod tests {
     }
 
     #[test]
+    fn member_completion_misses_instance_receiver() {
+        // The index lists a container's members by name, but doesn't resolve an
+        // instance (`Point p;` -> `p.`) to its type, so it returns nothing there
+        // — exactly the empty result that makes the completion handler fall
+        // through to the parser. The type name itself still completes.
+        let text = "struct Point{uint256 x;}contract C{Point p;}";
+        let ast = json!({
+            "id": 1, "nodeType": "SourceUnit", "src": "0:44:0", "nodes": [
+                { "id": 10, "nodeType": "StructDefinition", "name": "Point",
+                  "nameLocation": "7:5:0", "src": "0:24:0", "members": [
+                    { "id": 11, "nodeType": "VariableDeclaration", "name": "x",
+                      "nameLocation": "21:1:0", "src": "13:9:0",
+                      "typeDescriptions": { "typeString": "uint256" } }
+                  ] },
+                { "id": 20, "nodeType": "ContractDefinition", "name": "C",
+                  "nameLocation": "33:1:0", "src": "24:20:0", "nodes": [
+                    { "id": 21, "nodeType": "VariableDeclaration", "name": "p",
+                      "stateVariable": true, "nameLocation": "41:1:0", "src": "35:7:0",
+                      "typeDescriptions": { "typeString": "struct Point" } }
+                  ] }
+            ]
+        });
+        let idx = Index::build(&[src(1, "/M.sol", text, ast)]);
+        assert!(idx.member_completions("Point").iter().any(|i| i.label == "x"));
+        assert!(idx.member_completions("p").is_empty());
+    }
+
+    #[test]
     fn type_reference_indexed_once() {
         // `Foo a;` — solc emits a UserDefinedTypeName wrapping an IdentifierPath,
         // both with the same src/referencedDeclaration. The index must record the

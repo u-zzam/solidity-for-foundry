@@ -1164,15 +1164,27 @@ impl LanguageServer for Backend {
             Some(c) => {
                 // Magic-global members (msg./block./tx./abi.) are always available.
                 items.extend(complete::member_builtins(c));
-                // User-defined members: accurate index when valid, else the parser.
-                if let Some(root) = self.valid_index_root(&uri).await {
-                    if let Some(idx) = self.state.index.read().await.get(&root) {
-                        items.extend(idx.member_completions(c));
-                    }
+                // User-defined members: the accurate index when it can answer,
+                // else the parser. The index only knows a container's own direct
+                // members — it doesn't resolve an instance receiver to its type,
+                // walk inheritance, or register nested enums/structs — so when it
+                // comes back empty, fall through to the parser, which does all
+                // three (and also offers elementary-type builtins).
+                let from_index = match self.valid_index_root(&uri).await {
+                    Some(root) => self
+                        .state
+                        .index
+                        .read()
+                        .await
+                        .get(&root)
+                        .map(|idx| idx.member_completions(c))
+                        .unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                if from_index.is_empty() {
+                    items.extend(self.with_nav_map(&uri, |m| parse::member_completions(m, c)).await);
                 } else {
-                    let more =
-                        self.with_nav_map(&uri, |m| parse::member_completions(m, c)).await;
-                    items.extend(more);
+                    items.extend(from_index);
                 }
             }
             None => {
