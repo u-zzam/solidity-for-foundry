@@ -1171,6 +1171,14 @@ impl LanguageServer for Backend {
                         }
                     }
                 }
+
+                // Mechanical single-edit fixes for common solc error codes
+                // (visibility, data location, override/virtual, abstract,
+                // checksummed address, mutability). Each self-guards on the code
+                // and only fires when the edit is unambiguous.
+                if let Some((range, new_text, title)) = solc_quickfix(d, &text) {
+                    actions.push(quickfix(&uri, range, new_text, title));
+                }
             }
         }
 
@@ -1479,13 +1487,223 @@ fn diag_code_is(d: &Diagnostic, code: i32) -> bool {
     matches!(&d.code, Some(NumberOrString::Number(n)) if *n == code)
 }
 
+/// The contents of the first double-quoted run in a message, if any. solc names
+/// the concrete token it suggests (a pragma, a visibility, a checksummed address)
+/// verbatim between double quotes.
+fn quoted_str(msg: &str) -> Option<&str> {
+    let start = msg.find('"')? + 1;
+    let end = msg[start..].find('"')? + start;
+    Some(&msg[start..end])
+}
+
 /// Pull the suggested pragma out of solc's "does not specify required compiler
 /// version" message, which names it verbatim in quotes.
 fn pragma_from_message(msg: &str) -> Option<String> {
-    let start = msg.find('"')? + 1;
-    let end = msg[start..].find('"')? + start;
-    let candidate = msg[start..end].trim();
+    let candidate = quoted_str(msg)?.trim();
     candidate.starts_with("pragma").then(|| candidate.to_string())
+}
+
+/// A mechanical, unambiguous single-edit quick-fix for a common solc error,
+/// derived only from the diagnostic's code, message and range plus the current
+/// buffer. Returns `(range, replacement, title)`; `None` when the code isn't one
+/// we fix or the fix would be ambiguous. Each arm keeps the edit trivially
+/// correct (an order-independent specifier, a keyword insertion, a verbatim
+/// replacement) rather than guessing at anything solc didn't spell out.
+fn solc_quickfix(d: &Diagnostic, text: &str) -> Option<(Range, String, String)> {
+    let code = match &d.code {
+        Some(NumberOrString::Number(n)) => *n,
+        _ => return None,
+    };
+    match code {
+        9429 => fix_checksum(d, text),
+        3656 => fix_abstract(d, text),
+        6651 => fix_data_location(d, text),
+        4937 => fix_visibility(d, text),
+        2018 => fix_mutability(d, text),
+        9456 => fix_specifier(d, text, "override", "Add `override` specifier"),
+        4334 => fix_specifier(d, text, "virtual", "Add `virtual` specifier"),
+        _ => None,
+    }
+}
+
+/// A zero-width insertion of `ins` at byte `at`, with the given title.
+fn insertion(text: &str, at: usize, ins: &str, title: String) -> (Range, String, String) {
+    let pos = diagnostics::PositionMapper::new(text).position(at);
+    (Range::new(pos, pos), ins.to_string(), title)
+}
+
+/// Byte offset just past the closing `)` of the parameter list of a function
+/// whose declaration begins at or after `from`. Scans for the first `(` — bailing
+/// at a `{`, `;` or `=` so a declaration with no parameter list (e.g. a state
+/// variable) yields `None` — then matches nesting to its close. Solidity accepts
+/// visibility / mutability / `override` / `virtual` in any order, so inserting a
+/// specifier right here is always well-formed.
+fn after_param_list(text: &str, from: usize) -> Option<usize> {
+    let b = text.as_bytes();
+    let mut i = from.min(b.len());
+    while i < b.len() {
+        match b[i] {
+            b'(' => break,
+            b'{' | b';' | b'=' => return None,
+            _ => i += 1,
+        }
+    }
+    let mut depth = 0i32;
+    while i < b.len() {
+        match b[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The function-header text between `from` and the body `{` or `;`, so a caller
+/// can check which specifiers are already present.
+fn header_specifiers(text: &str, from: usize) -> &str {
+    let b = text.as_bytes();
+    let from = from.min(b.len());
+    let mut i = from;
+    while i < b.len() && b[i] != b'{' && b[i] != b';' {
+        i += 1;
+    }
+    &text[from..i]
+}
+
+/// Byte offset of `word` in `hay` as a whole token (not a substring of a larger
+/// identifier), if present.
+fn find_word(hay: &str, word: &str) -> Option<usize> {
+    let b = hay.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = hay[from..].find(word) {
+        let i = from + rel;
+        let before = i == 0 || !is_ident_byte(b[i - 1]);
+        let after = i + word.len() >= b.len() || !is_ident_byte(b[i + word.len()]);
+        if before && after {
+            return Some(i);
+        }
+        from = i + 1;
+    }
+    None
+}
+
+/// Where and how to splice a new function specifier (`kw`) so it reads in
+/// conventional order — after any existing visibility/mutability/modifiers, just
+/// before the return clause or body — with clean single-space padding regardless
+/// of the surrounding whitespace. `param_close` is the byte just past the
+/// parameter list. Returns the insertion `(byte, text)`.
+fn splice_specifier(text: &str, param_close: usize, kw: &str) -> (usize, String) {
+    let b = text.as_bytes();
+    let mut end = param_close.min(b.len());
+    while end < b.len() && b[end] != b'{' && b[end] != b';' {
+        end += 1;
+    }
+    let point = match find_word(&text[param_close..end], "returns") {
+        Some(rel) => param_close + rel,
+        None => end,
+    };
+    let lead = point > 0 && b.get(point - 1).is_some_and(|c| !c.is_ascii_whitespace());
+    let trail = b.get(point).is_some_and(|c| !c.is_ascii_whitespace());
+    let ins = format!("{}{kw}{}", if lead { " " } else { "" }, if trail { " " } else { "" });
+    (point, ins)
+}
+
+/// Insert an order-independent function specifier (`override` / `virtual`) into
+/// the header of the declaration at the diagnostic's location.
+fn fix_specifier(d: &Diagnostic, text: &str, kw: &str, title: &str) -> Option<(Range, String, String)> {
+    let start = diagnostics::PositionMapper::new(text).offset(d.range.start);
+    let at = after_param_list(text, start)?;
+    let (point, ins) = splice_specifier(text, at, kw);
+    Some(insertion(text, point, &ins, title.to_string()))
+}
+
+/// 4937 — insert the visibility solc names after the parameter list.
+fn fix_visibility(d: &Diagnostic, text: &str) -> Option<(Range, String, String)> {
+    let vis = quoted_str(&d.message)?;
+    if !matches!(vis, "public" | "private" | "internal" | "external") {
+        return None;
+    }
+    fix_specifier(d, text, vis, &format!("Add `{vis}` visibility"))
+}
+
+/// 2018 — restrict a function to `view`/`pure` (solc names which) by inserting the
+/// keyword. Skips the case where a mutability specifier is already present (a
+/// `view` that could be `pure`), which would need a replacement, not an insert.
+fn fix_mutability(d: &Diagnostic, text: &str) -> Option<(Range, String, String)> {
+    let kw = d.message.rsplit(' ').next().filter(|w| matches!(*w, "view" | "pure"))?;
+    let start = diagnostics::PositionMapper::new(text).offset(d.range.start);
+    let at = after_param_list(text, start)?;
+    if header_specifiers(text, at)
+        .split_whitespace()
+        .any(|w| matches!(w, "view" | "pure" | "payable"))
+    {
+        return None;
+    }
+    fix_specifier(d, text, kw, &format!("Restrict mutability to `{kw}`"))
+}
+
+/// 3656 — mark a contract `abstract` by inserting the keyword before `contract`.
+fn fix_abstract(d: &Diagnostic, text: &str) -> Option<(Range, String, String)> {
+    let start = diagnostics::PositionMapper::new(text).offset(d.range.start);
+    let rest = text.get(start..)?;
+    // The diagnostic must sit on the `contract` keyword itself.
+    if !rest.starts_with("contract") || rest.as_bytes().get(8).copied().is_some_and(is_ident_byte) {
+        return None;
+    }
+    Some(insertion(text, start, "abstract ", "Mark contract as `abstract`".to_string()))
+}
+
+/// 9429 — replace an address literal with the checksummed form solc names.
+fn fix_checksum(d: &Diagnostic, text: &str) -> Option<(Range, String, String)> {
+    let addr = quoted_str(&d.message)?;
+    if !addr.starts_with("0x") || addr.len() != 42 || !addr[2..].bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    // Only when the diagnostic is actually on an address literal.
+    if !slice(text, d.range).starts_with("0x") {
+        return None;
+    }
+    Some((d.range, addr.to_string(), format!("Convert to checksummed address `{addr}`")))
+}
+
+/// 6651 — insert a `memory` data location between a reference-type parameter/local
+/// and its name. `memory` is valid everywhere solc reports this in 0.8 (function
+/// parameters and locals), so it's the one unambiguous single-keyword fix;
+/// mappings (storage-only) and declarations that already name a location or have
+/// no variable name are left alone.
+fn fix_data_location(d: &Diagnostic, text: &str) -> Option<(Range, String, String)> {
+    let m = diagnostics::PositionMapper::new(text);
+    let start = m.offset(d.range.start);
+    let end = m.offset(d.range.end);
+    let decl = text.get(start..end)?;
+    if decl.contains("mapping")
+        || decl.split_whitespace().any(|w| matches!(w, "memory" | "storage" | "calldata"))
+    {
+        return None;
+    }
+    // The variable name is the trailing identifier; insert `memory` before it.
+    let b = text.as_bytes();
+    let mut name = end;
+    while name > start && b[name - 1].is_ascii_whitespace() {
+        name -= 1;
+    }
+    let name_end = name;
+    while name > start && is_ident_byte(b[name - 1]) {
+        name -= 1;
+    }
+    // Require both a trailing name and a preceding type.
+    if name == name_end || name == start {
+        return None;
+    }
+    Some(insertion(text, name, "memory ", "Add `memory` data location".to_string()))
 }
 
 /// 0-based line of the SPDX identifier, if the file has one.
@@ -1670,10 +1888,30 @@ async fn main() {
 mod tests {
     use super::{
         call_context, header_edit, import_line, member_context, pragma_from_message,
-        relative_import, under_libs, valid_new_name,
+        relative_import, solc_quickfix, under_libs, valid_new_name,
     };
+    use crate::diagnostics::PositionMapper;
     use std::path::Path;
-    use tower_lsp::lsp_types::Position;
+    use tower_lsp::lsp_types::{Diagnostic, NumberOrString, Position, Range};
+
+    /// Build a diagnostic carrying `code`, `message` and a range covering the
+    /// byte span `(start, end)` of `text`, for exercising `solc_quickfix`.
+    fn diag(code: i32, message: &str, text: &str, span: (usize, usize)) -> Diagnostic {
+        let m = PositionMapper::new(text);
+        Diagnostic {
+            range: Range::new(m.position(span.0), m.position(span.1)),
+            code: Some(NumberOrString::Number(code)),
+            message: message.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Splice a single quick-fix edit into `text`, to assert the resulting source.
+    fn apply_fix(text: &str, range: Range, new_text: &str) -> String {
+        let m = PositionMapper::new(text);
+        let (s, e) = (m.offset(range.start), m.offset(range.end));
+        format!("{}{}{}", &text[..s], new_text, &text[e..])
+    }
 
     #[test]
     fn rename_refuses_library_sources() {
@@ -1750,6 +1988,106 @@ mod tests {
         assert_eq!(call_context("min(a, max(b,", 13), Some(("max".into(), 1)));
         // a statement boundary means we are not inside a call
         assert_eq!(call_context("x = 1; y", 8), None);
+    }
+
+    #[test]
+    fn quickfix_checksum_replaces_address_literal() {
+        let text = "address a = 0x52908400098527886E0F7030069857d2E4169EE7;";
+        let lit = text.find("0x").unwrap();
+        let msg = "This looks like an address but has an invalid checksum. Correct \
+                   checksummed address: \"0x52908400098527886E0F7030069857D2E4169EE7\". \
+                   If this is not used as an address, please prepend '00'.";
+        let (range, nt, _) =
+            solc_quickfix(&diag(9429, msg, text, (lit, lit + 42)), text).unwrap();
+        assert_eq!(
+            apply_fix(text, range, &nt),
+            "address a = 0x52908400098527886E0F7030069857D2E4169EE7;"
+        );
+        // Skip: the message names no address to substitute.
+        assert!(solc_quickfix(&diag(9429, "no address here", text, (lit, lit + 42)), text).is_none());
+    }
+
+    #[test]
+    fn quickfix_visibility_inserts_after_param_list() {
+        let text = "function f() returns (uint) { return 1; }";
+        let span = (0, text.len());
+        let msg = "No visibility specified. Did you intend to add \"public\"?";
+        let (range, nt, _) = solc_quickfix(&diag(4937, msg, text, span), text).unwrap();
+        assert_eq!(apply_fix(text, range, &nt), "function f() public returns (uint) { return 1; }");
+        // Skip: the quoted word isn't a visibility keyword.
+        assert!(solc_quickfix(&diag(4937, "add \"foo\"?", text, span), text).is_none());
+    }
+
+    #[test]
+    fn quickfix_mutability_inserts_or_skips() {
+        let text = "function f() public returns (uint) { return s; }";
+        let (range, nt, _) = solc_quickfix(
+            &diag(2018, "Function state mutability can be restricted to view", text, (0, text.len())),
+            text,
+        )
+        .unwrap();
+        assert_eq!(apply_fix(text, range, &nt), "function f() public view returns (uint) { return s; }");
+        // Skip: a function that already has `view` would need a replacement, not
+        // an insertion, to become `pure`.
+        let v = "function f() public view returns (uint) { return 1; }";
+        assert!(solc_quickfix(
+            &diag(2018, "Function state mutability can be restricted to pure", v, (0, v.len())),
+            v,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn quickfix_override_and_virtual_insert_specifier() {
+        let text = "function foo() public returns (uint) { return 2; }";
+        let span = (0, text.len());
+        let (r, nt, _) = solc_quickfix(
+            &diag(9456, "Overriding function is missing \"override\" specifier.", text, span),
+            text,
+        )
+        .unwrap();
+        assert_eq!(apply_fix(text, r, &nt), "function foo() public override returns (uint) { return 2; }");
+        let (r, nt, _) = solc_quickfix(
+            &diag(4334, "Trying to override non-virtual function. Did you forget to add \"virtual\"?", text, span),
+            text,
+        )
+        .unwrap();
+        assert_eq!(apply_fix(text, r, &nt), "function foo() public virtual returns (uint) { return 2; }");
+        // Skip: a state-variable override has no parameter list to anchor on.
+        let sv = "uint256 public x;";
+        assert!(solc_quickfix(&diag(9456, "", sv, (0, sv.len())), sv).is_none());
+    }
+
+    #[test]
+    fn quickfix_abstract_prefixes_contract_keyword() {
+        let text = "contract T is I {}";
+        let (r, nt, _) = solc_quickfix(
+            &diag(3656, "Contract \"T\" should be marked as abstract.", text, (0, text.len())),
+            text,
+        )
+        .unwrap();
+        assert_eq!(apply_fix(text, r, &nt), "abstract contract T is I {}");
+        // Skip: the diagnostic doesn't start on the `contract` keyword.
+        let off = "  x contract T {}";
+        assert!(solc_quickfix(&diag(3656, "", off, (0, off.len())), off).is_none());
+    }
+
+    #[test]
+    fn quickfix_data_location_inserts_memory() {
+        let text = "string x";
+        let (r, nt, _) = solc_quickfix(
+            &diag(6651, "Data location must be \"memory\" or \"calldata\" for parameter in function, but none was given.", text, (0, text.len())),
+            text,
+        )
+        .unwrap();
+        assert_eq!(apply_fix(text, r, &nt), "string memory x");
+        // An array type, likewise.
+        let arr = "uint[] x";
+        let (r, nt, _) = solc_quickfix(&diag(6651, "Data location must be ...", arr, (0, arr.len())), arr).unwrap();
+        assert_eq!(apply_fix(arr, r, &nt), "uint[] memory x");
+        // Skip: a mapping can only live in storage.
+        let map = "mapping(uint => uint) x";
+        assert!(solc_quickfix(&diag(6651, "", map, (0, map.len())), map).is_none());
     }
 
     #[test]
