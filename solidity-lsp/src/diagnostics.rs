@@ -3,6 +3,7 @@
 //! The only fiddly part is the position model: solc reports byte offsets into
 //! the (UTF-8) source, while LSP positions are UTF-16 code units per line.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -17,26 +18,42 @@ use crate::project::LintFinding;
 /// Converts byte offsets within a single source file into LSP positions.
 pub struct PositionMapper<'a> {
     text: &'a str,
-    /// Byte offset of the first character of each line.
-    line_starts: Vec<usize>,
+    /// Byte offset of the first character of each line. Borrowed when a caller
+    /// hands in a table it already built (hot paths that map many offsets in one
+    /// file), owned when built from scratch.
+    line_starts: Cow<'a, [usize]>,
 }
 
 impl<'a> PositionMapper<'a> {
     pub fn new(text: &'a str) -> Self {
+        Self { text, line_starts: Cow::Owned(Self::line_starts_of(text)) }
+    }
+
+    /// Reuse a precomputed line-start table (from `line_starts_of`) instead of
+    /// rescanning `text`, so a loop emitting many positions/locations for one
+    /// file doesn't rebuild the O(file-size) table on every call.
+    pub fn with_line_starts(text: &'a str, line_starts: &'a [usize]) -> Self {
+        Self { text, line_starts: Cow::Borrowed(line_starts) }
+    }
+
+    /// Byte offset of each line's first character, to cache alongside a file and
+    /// feed back through `with_line_starts`.
+    pub fn line_starts_of(text: &str) -> Vec<usize> {
         let mut line_starts = vec![0usize];
         for (i, b) in text.bytes().enumerate() {
             if b == b'\n' {
                 line_starts.push(i + 1);
             }
         }
-        Self { text, line_starts }
+        line_starts
     }
 
     /// Byte offset -> 0-based UTF-16 (line, character), clamped to the document.
     pub fn position(&self, byte: usize) -> Position {
+        let ls: &[usize] = &self.line_starts;
         let byte = byte.min(self.text.len());
-        let line = self.line_starts.partition_point(|&s| s <= byte) - 1;
-        let line_start = self.line_starts[line];
+        let line = ls.partition_point(|&s| s <= byte) - 1;
+        let line_start = ls[line];
         // Walk back to a char boundary in case solc points mid-codepoint.
         let mut end = byte;
         while end > line_start && !self.text.is_char_boundary(end) {
@@ -51,15 +68,12 @@ impl<'a> PositionMapper<'a> {
 
     /// LSP position -> byte offset, clamped to the document. Inverse of `position`.
     pub fn offset(&self, pos: Position) -> usize {
+        let ls: &[usize] = &self.line_starts;
         let line = pos.line as usize;
-        let Some(&line_start) = self.line_starts.get(line) else {
+        let Some(&line_start) = ls.get(line) else {
             return self.text.len();
         };
-        let line_end = self
-            .line_starts
-            .get(line + 1)
-            .copied()
-            .unwrap_or(self.text.len());
+        let line_end = ls.get(line + 1).copied().unwrap_or(self.text.len());
         let mut utf16 = 0u32;
         let mut byte = line_start;
         for c in self.text[line_start..line_end].chars() {
@@ -330,5 +344,23 @@ mod tests {
         assert_eq!(m.position(999), Position::new(0, 3));
         // negative solc offsets clamp to start of file.
         assert_eq!(m.range(-1, -1), Range::new(Position::new(0, 0), Position::new(0, 0)));
+    }
+
+    #[test]
+    fn reused_line_starts_match_a_fresh_mapper() {
+        // A mapper built from a cached table must map identically to one that
+        // rescans the text, so hot paths can share one table per file safely.
+        let text = "let aé→b = 1;\nsecond line\n\nlast";
+        let ls = PositionMapper::line_starts_of(text);
+        let fresh = PositionMapper::new(text);
+        let reused = PositionMapper::with_line_starts(text, &ls);
+        for byte in 0..=text.len() {
+            if !text.is_char_boundary(byte) {
+                continue;
+            }
+            assert_eq!(fresh.position(byte), reused.position(byte), "byte {byte}");
+            let pos = fresh.position(byte);
+            assert_eq!(fresh.offset(pos), reused.offset(pos), "pos {pos:?}");
+        }
     }
 }

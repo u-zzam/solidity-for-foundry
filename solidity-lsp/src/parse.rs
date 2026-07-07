@@ -498,8 +498,10 @@ fn ident_at(file: &File, offset: usize) -> Option<&Ident> {
         .min_by_key(|i| i.end - i.start)
 }
 
-fn location(uri: &Url, text: &str, start: usize, end: usize) -> Location {
-    let m = PositionMapper::new(text);
+/// Build a Location from a byte span, reusing a mapper already built for this
+/// file — callers that emit many locations for one buffer (find-references,
+/// workspace symbols) build the O(file-size) mapper once per file, not per span.
+fn make_location(uri: &Url, m: &PositionMapper, start: usize, end: usize) -> Location {
     Location::new(uri.clone(), Range::new(m.position(start), m.position(end)))
 }
 
@@ -551,22 +553,24 @@ pub fn definition(files: &HashMap<Url, File>, uri: &Url, pos: Position) -> Vec<L
     };
     let same: Vec<&Def> = file.defs.iter().filter(|d| d.name == name).collect();
     if let Some(best) = same.iter().map(|d| common_scope(d.name_start)).min() {
+        let m = PositionMapper::new(&file.text);
         return same
             .iter()
             .filter(|d| common_scope(d.name_start) == best)
-            .map(|d| location(uri, &file.text, d.name_start, d.name_end))
+            .map(|d| make_location(uri, &m, d.name_start, d.name_end))
             .collect();
     }
-    files
-        .iter()
-        .filter(|(u, _)| *u != uri)
-        .flat_map(|(u, f)| {
-            f.defs
-                .iter()
-                .filter(|d| d.name == name)
-                .map(move |d| location(u, &f.text, d.name_start, d.name_end))
-        })
-        .collect()
+    let mut out = Vec::new();
+    for (u, f) in files {
+        if u == uri {
+            continue;
+        }
+        let m = PositionMapper::new(&f.text);
+        for d in f.defs.iter().filter(|d| d.name == name) {
+            out.push(make_location(u, &m, d.name_start, d.name_end));
+        }
+    }
+    out
 }
 
 /// Every occurrence of the identifier under the cursor across all buffers.
@@ -583,15 +587,14 @@ pub fn references(
     let Some(name) = ident_at(file, offset).map(|i| i.name.clone()) else {
         return Vec::new();
     };
-    files
-        .iter()
-        .flat_map(|(u, f)| {
-            f.idents
-                .iter()
-                .filter(|i| i.name == name && (include_decl || !i.is_def))
-                .map(move |i| location(u, &f.text, i.start, i.end))
-        })
-        .collect()
+    let mut out = Vec::new();
+    for (u, f) in files {
+        let m = PositionMapper::new(&f.text);
+        for i in f.idents.iter().filter(|i| i.name == name && (include_decl || !i.is_def)) {
+            out.push(make_location(u, &m, i.start, i.end));
+        }
+    }
+    out
 }
 
 /// Same-file highlights of the identifier under the cursor (declaration sites
@@ -681,6 +684,7 @@ pub fn workspace_symbols(files: &HashMap<Url, File>, query: &str) -> Vec<SymbolI
     let q = query.to_lowercase();
     let mut out = Vec::new();
     for (uri, f) in files {
+        let m = PositionMapper::new(&f.text);
         for d in &f.defs {
             if matches!(d.kind, DefKind::Local | DefKind::Param) {
                 continue;
@@ -694,7 +698,7 @@ pub fn workspace_symbols(files: &HashMap<Url, File>, query: &str) -> Vec<SymbolI
                 kind: d.kind.symbol_kind(),
                 tags: None,
                 deprecated: None,
-                location: location(uri, &f.text, d.name_start, d.name_end),
+                location: make_location(uri, &m, d.name_start, d.name_end),
                 container_name: d.container.map(|i| f.defs[i].name.clone()),
             });
         }

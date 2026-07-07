@@ -81,6 +81,10 @@ struct RefSpan {
 struct FileEntry {
     uri: Url,
     text: String,
+    /// Byte offset of each line's first character, precomputed once so mapping a
+    /// span to a Location doesn't rescan the whole file per emitted location (a
+    /// find-references with hundreds of hits would otherwise rebuild it per hit).
+    line_starts: Vec<usize>,
     /// Clickable spans (references + declaration names) mapping to a declaration.
     spans: Vec<Span>,
     /// Clickable import-path literals mapping to the imported file's source slot,
@@ -175,14 +179,15 @@ impl Index {
             // staleness gate (`matches`) must compare against it, or a save landing
             // mid-compile pairs new text with old offsets yet passes the gate.
             let text = s.text.clone();
+            let line_starts = PositionMapper::line_starts_of(&text);
             let canon = std::fs::canonicalize(&s.path).unwrap_or_else(|_| s.path.clone());
             let Ok(uri) = Url::from_file_path(&canon) else {
                 continue;
             };
             path_to_index.insert(canon, s.index);
 
-            let mapper = PositionMapper::new(&text);
-            let symbols = doc_symbols(&s.ast, &mapper);
+            let symbols =
+                doc_symbols(&s.ast, &PositionMapper::with_line_starts(&text, &line_starts));
 
             let mut spans = Vec::new();
             let mut imports = Vec::new();
@@ -301,6 +306,7 @@ impl Index {
                 FileEntry {
                     uri,
                     text,
+                    line_starts,
                     spans,
                     imports,
                     symbols,
@@ -314,8 +320,11 @@ impl Index {
         // references alike). Needs the full `decls` map, so it runs after the
         // per-file loop.
         for f in files.values_mut() {
-            let mapper = PositionMapper::new(&f.text);
-            f.tokens = encode_tokens(&f.spans, &decls, &param_ids, &mapper);
+            let tokens = {
+                let mapper = PositionMapper::with_line_starts(&f.text, &f.line_starts);
+                encode_tokens(&f.spans, &decls, &param_ids, &mapper)
+            };
+            f.tokens = tokens;
         }
 
         // Resolve queued call-site hints now that every declaration is known
@@ -334,7 +343,8 @@ impl Index {
                 continue;
             };
             if let Some(f) = files.get_mut(&h.src_index) {
-                let pos = PositionMapper::new(&f.text).position(h.byte);
+                let pos =
+                    PositionMapper::with_line_starts(&f.text, &f.line_starts).position(h.byte);
                 f.hints.push((pos, label));
             }
         }
@@ -390,16 +400,16 @@ impl Index {
     pub fn rename_range(&self, path: &Path, pos: Position) -> Option<Range> {
         let slot = self.slot_for(path)?;
         let f = self.files.get(&slot)?;
-        let offset = PositionMapper::new(&f.text).offset(pos);
+        let m = PositionMapper::with_line_starts(&f.text, &f.line_starts);
+        let offset = m.offset(pos);
         let span = f
             .spans
             .iter()
             .filter(|s| s.start <= offset && offset < s.end)
             .min_by_key(|s| s.end - s.start)?;
-        self.decls.contains_key(&span.decl).then(|| {
-            let m = PositionMapper::new(&f.text);
-            Range::new(m.position(span.start), m.position(span.end))
-        })
+        self.decls
+            .contains_key(&span.decl)
+            .then(|| Range::new(m.position(span.start), m.position(span.end)))
     }
 
     /// The file that declares the symbol under the cursor, if it resolves — so a
@@ -462,7 +472,7 @@ impl Index {
         // Not on a symbol — maybe on an import path literal, which jumps to the
         // top of the imported file.
         let f = self.slot_for(path).and_then(|i| self.files.get(&i))?;
-        let offset = PositionMapper::new(&f.text).offset(pos);
+        let offset = PositionMapper::with_line_starts(&f.text, &f.line_starts).offset(pos);
         let imp = f.imports.iter().find(|i| i.start <= offset && offset < i.end)?;
         self.location(imp.target, 0, 0)
     }
@@ -673,7 +683,7 @@ impl Index {
     fn resolve(&self, path: &Path, pos: Position) -> Option<i64> {
         let idx = self.slot_for(path)?;
         let f = self.files.get(&idx)?;
-        let offset = PositionMapper::new(&f.text).offset(pos);
+        let offset = PositionMapper::with_line_starts(&f.text, &f.line_starts).offset(pos);
         f.spans
             .iter()
             .filter(|s| s.start <= offset && offset < s.end)
@@ -688,7 +698,7 @@ impl Index {
 
     fn location(&self, src_index: usize, start: usize, end: usize) -> Option<Location> {
         let f = self.files.get(&src_index)?;
-        let m = PositionMapper::new(&f.text);
+        let m = PositionMapper::with_line_starts(&f.text, &f.line_starts);
         Some(Location::new(
             f.uri.clone(),
             Range::new(m.position(start), m.position(end)),
