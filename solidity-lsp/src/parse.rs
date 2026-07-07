@@ -796,7 +796,10 @@ pub fn call_hints(files: &HashMap<Url, File>, uri: &Url, range: Range) -> Vec<In
             continue;
         };
         let params = if cands.len() == 1 {
-            Some(cands[0])
+            // One name match: use it unless it takes fewer params than the call
+            // has args (a different overload/signature). Fewer args than params
+            // is mid-typing, so keep hinting the ones already written.
+            (call.args.len() <= cands[0].len()).then_some(cands[0])
         } else {
             cands.iter().copied().find(|p| p.len() == call.args.len())
         };
@@ -948,6 +951,36 @@ contract Counter {
         assert!(labels.contains(&"a:".to_string()), "{labels:?}");
         assert!(labels.contains(&"b:".to_string()), "{labels:?}");
         assert!(labels.contains(&"newCount:".to_string()), "{labels:?}");
+    }
+
+    #[test]
+    fn call_hints_skip_when_more_args_than_params() {
+        const SRC: &str = r#"
+contract C {
+    function two(uint256 a, uint256 b) internal {}
+    function f() public {
+        two(1, 2, 3);
+        two(9);
+    }
+}
+"#;
+        let uri = Url::parse("file:///C.sol").unwrap();
+        let mut files = HashMap::new();
+        files.insert(uri.clone(), parse(SRC));
+        let m = PositionMapper::new(SRC);
+        let full = Range::new(m.position(0), m.position(SRC.len()));
+        let labels: Vec<String> = call_hints(&files, &uri, full)
+            .iter()
+            .map(|h| match &h.label {
+                InlayHintLabel::String(s) => s.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        // two(1, 2, 3): 3 args > 2 params -> the whole call is skipped, so `b:`
+        // (only reachable via that call) never appears.
+        assert!(!labels.contains(&"b:".to_string()), "{labels:?}");
+        // two(9): fewer args than params is mid-typing -> still hint `a:`.
+        assert!(labels.contains(&"a:".to_string()), "{labels:?}");
     }
 
     #[test]
