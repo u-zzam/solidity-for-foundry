@@ -23,6 +23,9 @@ solidity-zed/extension.wasm
 # Local Claude Code instructions (machine-specific paths; kept out of the public repo)
 CLAUDE.md
 
+# Local Codex instructions 
+AGENTS.md
+
 # Internal design / analysis docs (kept local, out of the public repo)
 docs/
 
