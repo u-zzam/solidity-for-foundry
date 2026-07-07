@@ -140,6 +140,9 @@ pub struct Index {
     /// Base callable id -> the ids of functions that override it, for
     /// go-to-implementation (an interface/virtual function -> its overrides).
     impls: HashMap<i64, Vec<i64>>,
+    /// Inverse of `impls`: an overriding function's id -> the base ids it
+    /// overrides, so rename can walk out to the whole override family.
+    bases: HashMap<i64, Vec<i64>>,
 }
 
 impl Index {
@@ -156,6 +159,7 @@ impl Index {
         let mut param_ids: HashSet<i64> = HashSet::new();
         let mut top_level: HashSet<i64> = HashSet::new();
         let mut impls: HashMap<i64, Vec<i64>> = HashMap::new();
+        let mut bases: HashMap<i64, Vec<i64>> = HashMap::new();
 
         // Each `ImportDirective.sourceUnit` is the imported file's SourceUnit node
         // id; map every source unit's root id to its slot so an import resolves to
@@ -214,11 +218,14 @@ impl Index {
                             callables.entry(name.to_string()).or_default().push(id);
                             collect_param_ids(map, &mut param_ids);
                             // Record this function as an implementation of each
-                            // base it overrides (inverse of `baseFunctions`).
-                            if let Some(bases) = map.get("baseFunctions").and_then(|b| b.as_array())
+                            // base it overrides (inverse of `baseFunctions`), and
+                            // the reverse edge, so rename can span the family.
+                            if let Some(base_fns) =
+                                map.get("baseFunctions").and_then(|b| b.as_array())
                             {
-                                for base in bases.iter().filter_map(|b| b.as_i64()) {
+                                for base in base_fns.iter().filter_map(|b| b.as_i64()) {
                                     impls.entry(base).or_default().push(id);
+                                    bases.entry(id).or_default().push(base);
                                 }
                             }
                         }
@@ -341,6 +348,7 @@ impl Index {
             callables,
             top_level,
             impls,
+            bases,
         }
     }
 
@@ -482,25 +490,52 @@ impl Index {
         Some(md)
     }
 
-    /// Rename the declaration under the cursor everywhere it is referenced.
-    pub fn rename(&self, path: &Path, pos: Position, new_name: &str) -> Option<WorkspaceEdit> {
-        let id = self.resolve(path, pos)?;
-        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
-        let mut push = |loc: Location| {
-            changes.entry(loc.uri).or_default().push(TextEdit {
-                range: loc.range,
-                new_text: new_name.to_string(),
-            });
-        };
-        if let Some(refs) = self.refs_by_decl.get(&id) {
-            for r in refs {
-                if let Some(loc) = self.location(r.src_index, r.start, r.end) {
-                    push(loc);
-                }
+    /// Every function in the override family of `id`: itself, the base functions
+    /// it overrides, and everything overriding those (transitively). Renaming a
+    /// base or interface function without the family leaves the derived
+    /// `override`s and their call sites bound to the old name, breaking the build.
+    fn override_closure(&self, id: i64) -> HashSet<i64> {
+        let mut seen = HashSet::new();
+        let mut stack = vec![id];
+        while let Some(x) = stack.pop() {
+            if !seen.insert(x) {
+                continue;
+            }
+            if let Some(overrides) = self.impls.get(&x) {
+                stack.extend(overrides.iter().copied());
+            }
+            if let Some(base_fns) = self.bases.get(&x) {
+                stack.extend(base_fns.iter().copied());
             }
         }
-        if let Some(loc) = self.decl_location(id) {
-            push(loc);
+        seen
+    }
+
+    /// Rename the declaration under the cursor everywhere it is referenced,
+    /// spanning its whole override family (see `override_closure`).
+    pub fn rename(&self, path: &Path, pos: Position, new_name: &str) -> Option<WorkspaceEdit> {
+        let id = self.resolve(path, pos)?;
+        // Collect every span to edit as (src_index, start, end); sort + dedup so a
+        // range is never edited twice (LSP rejects overlapping edits).
+        let mut spans: Vec<(usize, usize, usize)> = Vec::new();
+        for cid in self.override_closure(id) {
+            if let Some(refs) = self.refs_by_decl.get(&cid) {
+                spans.extend(refs.iter().map(|r| (r.src_index, r.start, r.end)));
+            }
+            if let Some(d) = self.decls.get(&cid) {
+                spans.push((d.src_index, d.name_start, d.name_end));
+            }
+        }
+        spans.sort_unstable();
+        spans.dedup();
+        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+        for (src_index, start, end) in spans {
+            if let Some(loc) = self.location(src_index, start, end) {
+                changes.entry(loc.uri).or_default().push(TextEdit {
+                    range: loc.range,
+                    new_text: new_name.to_string(),
+                });
+            }
         }
         (!changes.is_empty()).then(|| WorkspaceEdit {
             changes: Some(changes),
@@ -1262,6 +1297,37 @@ mod tests {
             apply(text, edits_for(&edit, &uri)),
             "library L{struct T{}}\ncontract C{L.T a;}"
         );
+    }
+
+    #[test]
+    fn rename_spans_the_override_family() {
+        // A base function, an override of it (baseFunctions), and a call to the
+        // override. Renaming the base must rename the override and its call site
+        // too, or the override no longer matches and the build breaks.
+        let text = "function foo(){}\nfunction foo(){}\nfoo();";
+        let ast = json!({
+            "id": 1, "nodeType": "SourceUnit", "src": "0:40:0",
+            "nodes": [
+                { "id": 10, "nodeType": "FunctionDefinition", "name": "foo",
+                  "kind": "function", "nameLocation": "9:3:0", "src": "0:16:0" },
+                { "id": 20, "nodeType": "FunctionDefinition", "name": "foo",
+                  "kind": "function", "nameLocation": "26:3:0", "src": "17:16:0",
+                  "baseFunctions": [10] },
+                { "id": 30, "nodeType": "FunctionCall", "kind": "functionCall",
+                  "src": "34:5:0", "arguments": [],
+                  "expression": { "id": 31, "nodeType": "Identifier", "name": "foo",
+                                  "src": "34:3:0", "referencedDeclaration": 20 } }
+            ]
+        });
+        let path = "/no-such-dir-solidity-lsp/A.sol";
+        let idx = Index::build(&[src(1, path, text, ast)]);
+        let p = Path::new(path);
+        let base_pos = Position::new(0, 9); // on the base `foo`
+        let edit = idx.rename(p, base_pos, "bar").unwrap();
+        let uri = Url::from_file_path(p).unwrap();
+        let edits = edits_for(&edit, &uri);
+        assert_eq!(edits.len(), 3, "base decl + override decl + call site");
+        assert_eq!(apply(text, edits), "function bar(){}\nfunction bar(){}\nbar();");
     }
 
     #[test]
