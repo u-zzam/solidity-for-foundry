@@ -763,10 +763,15 @@ impl LanguageServer for Backend {
         let req = params.range;
         let mut actions: Vec<CodeActionOrCommand> = Vec::new();
 
-        // `forge lint` suggested replacements (from the last compile).
-        if let Some(file_fixes) = self.state.fixes.lock().await.get(&uri) {
-            for f in file_fixes.iter().filter(|f| ranges_overlap(f.range, req)) {
-                actions.push(quickfix(&uri, f.range, f.new_text.clone(), f.title.clone()));
+        // `forge lint` suggested replacements (from the last compile). Their byte
+        // ranges are the on-disk text's, so once the buffer has unsaved edits
+        // applying one would splice at a shifted position. Skip them while dirty
+        // (as diagnostics/semantic tokens already do); they reappear on save.
+        if !self.is_dirty(&uri).await {
+            if let Some(file_fixes) = self.state.fixes.lock().await.get(&uri) {
+                for f in file_fixes.iter().filter(|f| ranges_overlap(f.range, req)) {
+                    actions.push(quickfix(&uri, f.range, f.new_text.clone(), f.title.clone()));
+                }
             }
         }
 
