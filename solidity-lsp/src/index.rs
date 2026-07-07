@@ -14,9 +14,10 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, Documentation, DocumentHighlight, DocumentHighlightKind,
-    DocumentSymbol, InlayHint, InlayHintKind, InlayHintLabel, Location, ParameterInformation,
-    ParameterLabel, Position, Range, SemanticToken, SemanticTokenType, SignatureHelp,
-    SignatureInformation, SymbolInformation, SymbolKind, TextEdit, Url, WorkspaceEdit,
+    DocumentSymbol, InlayHint, InlayHintKind, InlayHintLabel, Location, MarkupContent, MarkupKind,
+    ParameterInformation, ParameterLabel, Position, Range, SemanticToken, SemanticTokenType,
+    SignatureHelp, SignatureInformation, SymbolInformation, SymbolKind, TextEdit, Url,
+    WorkspaceEdit,
 };
 
 use crate::diagnostics::PositionMapper;
@@ -57,6 +58,7 @@ struct Member {
     name: String,
     kind: String,
     detail: String,
+    doc: Option<String>,
 }
 
 impl Decl {
@@ -722,6 +724,7 @@ impl Index {
                         label: m.name.clone(),
                         kind: Some(completion_kind(&m.kind)),
                         detail: (!m.detail.is_empty()).then(|| m.detail.clone()),
+                        documentation: m.doc.as_deref().and_then(completion_doc),
                         ..Default::default()
                     })
                     .collect()
@@ -740,6 +743,7 @@ impl Index {
                 label: d.name.clone(),
                 kind: Some(completion_kind(&d.kind)),
                 detail: d.signature.clone().or_else(|| d.type_string.clone()),
+                documentation: d.doc.as_deref().and_then(completion_doc),
                 ..Default::default()
             })
             .collect()
@@ -1202,7 +1206,7 @@ fn member_of(node: &Value) -> Option<Member> {
     let name = gets(map, "name").filter(|n| !n.is_empty())?;
     let kind = gets(map, "nodeType")?;
     let detail = signature(map).or_else(|| type_string(map)).unwrap_or_default();
-    Some(Member { name: name.to_string(), kind: kind.to_string(), detail })
+    Some(Member { name: name.to_string(), kind: kind.to_string(), detail, doc: documentation(map) })
 }
 
 fn completion_kind(node_type: &str) -> CompletionItemKind {
@@ -1263,6 +1267,14 @@ fn documentation(map: &Map<String, Value>) -> Option<String> {
         Some(Value::Object(o)) => o.get("text").and_then(|v| v.as_str()).map(String::from),
         _ => None,
     }
+}
+
+/// A declaration's NatSpec as Markdown completion documentation, or `None` when
+/// it renders to nothing (empty, or a bare `@inheritdoc`).
+fn completion_doc(raw: &str) -> Option<Documentation> {
+    let md = format_natspec(raw);
+    (!md.is_empty())
+        .then_some(Documentation::MarkupContent(MarkupContent { kind: MarkupKind::Markdown, value: md }))
 }
 
 /// Render solc's raw NatSpec text as readable Markdown. solc strips the comment
@@ -1576,6 +1588,37 @@ mod tests {
         assert_eq!(idx.references(p, Position::new(0, 7), false), Some(Vec::new()));
         // On the trailing `}`: nothing resolves.
         assert_eq!(idx.references(p, Position::new(0, 11), false), None);
+    }
+
+    #[test]
+    fn completion_items_carry_natspec_docs() {
+        // A documented top-level function and a documented struct field: both the
+        // global and member completion surfaces render the NatSpec hover already
+        // used, rather than dropping it.
+        let text = "function f(){}\nstruct S{uint256 x;}";
+        let ast = json!({
+            "id": 1, "nodeType": "SourceUnit", "src": "0:34:0", "nodes": [
+                { "id": 10, "nodeType": "FunctionDefinition", "name": "f", "kind": "function",
+                  "nameLocation": "9:1:0", "src": "0:14:0",
+                  "documentation": { "nodeType": "StructuredDocumentation", "text": "@notice does a thing" } },
+                { "id": 20, "nodeType": "StructDefinition", "name": "S",
+                  "nameLocation": "22:1:0", "src": "15:19:0", "members": [
+                    { "id": 21, "nodeType": "VariableDeclaration", "name": "x",
+                      "nameLocation": "31:1:0", "src": "24:9:0",
+                      "typeDescriptions": { "typeString": "uint256" },
+                      "documentation": { "nodeType": "StructuredDocumentation", "text": "@notice the x coord" } }
+                  ] }
+            ]
+        });
+        let idx = Index::build(&[src(1, "/D.sol", text, ast)]);
+        let doc_of = |items: Vec<CompletionItem>, label: &str| {
+            items.into_iter().find(|i| i.label == label).and_then(|i| match i.documentation {
+                Some(Documentation::MarkupContent(m)) => Some(m.value),
+                _ => None,
+            })
+        };
+        assert!(doc_of(idx.global_completions(), "f").unwrap().contains("does a thing"));
+        assert!(doc_of(idx.member_completions("S"), "x").unwrap().contains("the x coord"));
     }
 
     #[test]
