@@ -53,6 +53,9 @@ struct State {
     /// Roots we've already warned about an unparseable foundry.toml, so the
     /// "using default settings" notice logs once, not on every compile.
     warned_config: Mutex<HashSet<PathBuf>>,
+    /// Roots we've already shown a live-check (solc install/compile) failure for,
+    /// so a first-run failure is surfaced once instead of on every keystroke.
+    warned_solc: Mutex<HashSet<PathBuf>>,
 }
 
 /// Clears a root from the in-flight indexing set when dropped, so a panic during
@@ -447,8 +450,27 @@ impl Backend {
             None => project::check_standalone(&t, &buf),
         })
         .await;
-        let Ok(Ok(errors)) = errors else {
-            return;
+        let errors = match errors {
+            Ok(Ok(errors)) => errors,
+            Ok(Err(e)) => {
+                // A solc install/compile failure (svm can't fetch solc, no
+                // network, a broken toolchain) is otherwise invisible — the
+                // check just drops it. Surface the first one per project so a
+                // first-run failure isn't silent; standalone files (no root)
+                // stay quiet to avoid noise.
+                if let Some(root) = &root {
+                    if self.state.warned_solc.lock().await.insert(root.clone()) {
+                        self.client
+                            .show_message(
+                                MessageType::ERROR,
+                                format!("Solidity live check failed: {e}"),
+                            )
+                            .await;
+                    }
+                }
+                return;
+            }
+            Err(_) => return, // the check task was cancelled or panicked
         };
 
         // A newer edit landed while solc ran — these checks aren't mutually
@@ -542,6 +564,28 @@ impl LanguageServer for Backend {
         self.client
             .log_message(MessageType::INFO, "solidity-for-foundry-lsp ready")
             .await;
+        // forge drives fmt/lint and (via svm) solc installs; without it those
+        // features silently do nothing. Warn once at startup if it's absent.
+        let has_forge = tokio::task::spawn_blocking(|| {
+            std::process::Command::new("forge")
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok()
+        })
+        .await
+        .unwrap_or(false);
+        if !has_forge {
+            self.client
+                .show_message(
+                    MessageType::WARNING,
+                    "`forge` was not found on PATH; formatting and lint are disabled. \
+                     Install Foundry: https://getfoundry.sh"
+                        .to_string(),
+                )
+                .await;
+        }
     }
 
     async fn shutdown(&self) -> Result<()> {
