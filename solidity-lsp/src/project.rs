@@ -614,27 +614,90 @@ fn detect_solc(text: &str) -> Option<Version> {
         .find_map(|tok| Version::parse(tok).ok())
 }
 
-/// Type-check a single self-contained buffer that has no Foundry project, for
-/// config-less live diagnostics. Files with imports are skipped: without a
-/// project their imports can't be resolved, and surfacing false "file not found"
-/// errors is precisely the failure mode this server exists to avoid. solc is
-/// taken from the buffer's pragma and auto-installed via svm.
+/// Type-check a single buffer that has no Foundry project, for config-less live
+/// diagnostics. Relative (`./`, `../`) imports are resolved transitively from
+/// disk and fed to solc alongside the buffer. Any import that can't be resolved
+/// this way — a remapped or library import, or a file missing on disk — means we
+/// can't reproduce the real graph, so the whole check is skipped rather than
+/// surface false "file not found" errors (precisely the failure mode this server
+/// exists to avoid). solc is taken from the buffer's pragma and installed via svm.
 pub fn check_standalone(target: &Path, buffer: &str) -> Result<Vec<SolcError>, String> {
-    if buffer.lines().any(|l| l.trim_start().starts_with("import ")) {
-        return Ok(Vec::new());
-    }
     let version = detect_solc(buffer).ok_or("no concrete solc version in pragma")?;
-    let solc = Solc::find_or_install(&version).map_err(|e| e.to_string())?;
 
+    // Collect the buffer plus every relative import reachable from it. Bail to an
+    // empty result the moment an import isn't a resolvable relative file.
+    let mut sources: HashMap<PathBuf, String> = HashMap::new();
+    let target = normalize_path(target);
+    let mut queue = vec![(target.clone(), buffer.to_string())];
+    sources.insert(target.clone(), buffer.to_string());
+    while let Some((path, text)) = queue.pop() {
+        let dir = path.parent().unwrap_or(&path);
+        for imp in relative_imports(&text) {
+            let Some(imp) = imp else {
+                return Ok(Vec::new()); // an import we can't resolve standalone
+            };
+            let resolved = normalize_path(&dir.join(imp));
+            if sources.contains_key(&resolved) {
+                continue;
+            }
+            let Ok(dep) = std::fs::read_to_string(&resolved) else {
+                return Ok(Vec::new()); // a referenced file is missing on disk
+            };
+            sources.insert(resolved.clone(), dep.clone());
+            queue.push((resolved, dep));
+        }
+    }
+
+    let solc = Solc::find_or_install(&version).map_err(|e| e.to_string())?;
     let mut input = SolcInput::default();
-    input.sources.insert(target.to_path_buf(), Source::new(buffer));
+    for (path, text) in sources {
+        input.sources.insert(path, Source::new(text));
+    }
     input.settings.output_selection = Default::default(); // type-check only
     let input = input.sanitized(&version);
 
     let output = solc.compile_exact(&input).map_err(|e| e.to_string())?;
     // Apply forge's default warning suppression (license, code-size, …).
-    let root = target.parent().unwrap_or(target);
+    let root = target.parent().unwrap_or(&target);
     Ok(filter_errors(output.errors, root, &Config::default()))
+}
+
+/// The import paths of `text`, one entry per `import` line: `Some(path)` for a
+/// relative `./`/`../` import, `None` for anything else (a bare, remapped or
+/// library import, or a line we can't extract a path from) — the caller treats a
+/// `None` as unresolvable and skips the standalone check.
+fn relative_imports(text: &str) -> Vec<Option<&str>> {
+    text.lines()
+        .map(str::trim_start)
+        .filter(|l| l.starts_with("import "))
+        .map(|l| {
+            quoted(l).filter(|p| p.starts_with("./") || p.starts_with("../"))
+        })
+        .collect()
+}
+
+/// The contents of the first `"..."` or `'...'` in `s`, if any.
+fn quoted(s: &str) -> Option<&str> {
+    let start = s.find(['"', '\''])?;
+    let q = s.as_bytes()[start];
+    let rest = &s[start + 1..];
+    rest.find(q as char).map(|end| &rest[..end])
+}
+
+/// Lexically normalize a path (fold away `.` and `..`), without touching the
+/// filesystem, so a key matches how solc names the same source unit.
+fn normalize_path(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            c => out.push(c.as_os_str()),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -709,6 +772,23 @@ mod tests {
         // No pragma, or no concrete x.y.z, yields nothing.
         assert_eq!(detect_solc("contract C {}"), None);
         assert_eq!(detect_solc("pragma solidity ^0.8;"), None);
+    }
+
+    #[test]
+    fn standalone_import_resolution() {
+        // quoted extracts the first quoted string, either quote style.
+        assert_eq!(quoted("import \"./A.sol\";"), Some("./A.sol"));
+        assert_eq!(quoted("import {X} from '../lib/B.sol';"), Some("../lib/B.sol"));
+        assert_eq!(quoted("no quotes"), None);
+
+        // Relative imports resolve; a remapped/library import is None, which
+        // makes the caller skip the standalone check.
+        let src = "pragma solidity 0.8.20;\nimport \"./A.sol\";\nimport \"@oz/C.sol\";\nx";
+        assert_eq!(relative_imports(src), vec![Some("./A.sol"), None]);
+
+        // Keys are lexically normalized so they match solc's source unit names.
+        assert_eq!(normalize_path(Path::new("/a/b/./c")), PathBuf::from("/a/b/c"));
+        assert_eq!(normalize_path(Path::new("/a/b/../c/D.sol")), PathBuf::from("/a/c/D.sol"));
     }
 
     #[test]
