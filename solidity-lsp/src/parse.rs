@@ -329,14 +329,17 @@ fn def_of(node: Node, src: &[u8]) -> Option<(String, DefKind, usize, usize)> {
 /// the whole node when bodyless), with interior whitespace collapsed.
 fn header(node: Node, src: &[u8]) -> String {
     let start = node.start_byte();
+    // Stop at the body (functions) or the initializer expression (state/constant
+    // variables). Slicing at the `value` field's start keeps mapping types
+    // intact, unlike splitting on `=` which also cut the `=>` in `mapping(...)`.
     let stop = node
         .child_by_field_name("body")
+        .or_else(|| node.child_by_field_name("value"))
         .map(|b| b.start_byte())
         .unwrap_or_else(|| node.end_byte());
     let raw = std::str::from_utf8(&src[start..stop.min(src.len())]).unwrap_or("");
-    // Drop a trailing initializer and the terminator, then collapse whitespace.
-    let raw = raw.split('=').next().unwrap_or(raw);
-    let raw = raw.trim().trim_end_matches([';', '{']).trim();
+    // Drop the trailing `=`/terminator left by the slice, then collapse whitespace.
+    let raw = raw.trim().trim_end_matches(['=', ';', '{']).trim();
     raw.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -1027,6 +1030,23 @@ contract Token is Base {
             parse("contract A { struct B { uint256 x; } } contract B { struct A { uint256 y; } }");
         let syms = document_symbols(&indirect);
         assert_eq!(syms.iter().filter(|s| s.name == "A" || s.name == "B").count(), 2);
+    }
+
+    #[test]
+    fn header_keeps_mapping_type_and_drops_initializer() {
+        // The `=>` inside a mapping type must survive; a state-var initializer
+        // must be dropped at the `value` field, not by splitting on `=`.
+        let file = parse(
+            "contract C {\n    mapping(address => uint256) public balanceOf;\n    uint256 public count = 5;\n}",
+        );
+        let c = document_symbols(&file);
+        let c = c.iter().find(|s| s.name == "C").unwrap();
+        let members = c.children.as_ref().unwrap();
+        let detail = |name: &str| {
+            members.iter().find(|s| s.name == name).unwrap().detail.as_deref().unwrap()
+        };
+        assert_eq!(detail("balanceOf"), "mapping(address => uint256) public balanceOf");
+        assert_eq!(detail("count"), "uint256 public count");
     }
 
     #[test]
