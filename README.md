@@ -114,6 +114,12 @@ Verified against real Foundry codebases — Morpho Blue, Aave v3 & v4, Uniswap v
 
 Planned: solar-based *type-aware* live resolution (live navigation is name-based today, made precise by the solc AST on the next compile); published Marketplace / Open VSX / Zed registry listings.
 
+## Contributing
+
+Bug reports and PRs welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the
+dev setup, PR expectations, and the versioning / release policy. User-facing
+changes are tracked in [CHANGELOG.md](CHANGELOG.md).
+
 ## License
 
 MIT.
