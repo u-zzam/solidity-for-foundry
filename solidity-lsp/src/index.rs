@@ -515,15 +515,28 @@ impl Index {
     /// spanning its whole override family (see `override_closure`).
     pub fn rename(&self, path: &Path, pos: Position, new_name: &str) -> Option<WorkspaceEdit> {
         let id = self.resolve(path, pos)?;
+        let old = self.decls.get(&id)?.name.clone();
         // Collect every span to edit as (src_index, start, end); sort + dedup so a
         // range is never edited twice (LSP rejects overlapping edits).
         let mut spans: Vec<(usize, usize, usize)> = Vec::new();
+        let mut add = |src_index: usize, start: usize, end: usize| {
+            // Only rewrite spans whose current text is the old name. An import
+            // alias use (`import {Foo as F}`) resolves to `Foo` but reads `F`, so
+            // renaming `Foo` must leave `F` alone; this also guards against any
+            // span whose bytes no longer spell the declaration.
+            if self.files.get(&src_index).and_then(|f| f.text.get(start..end)) == Some(old.as_str())
+            {
+                spans.push((src_index, start, end));
+            }
+        };
         for cid in self.override_closure(id) {
             if let Some(refs) = self.refs_by_decl.get(&cid) {
-                spans.extend(refs.iter().map(|r| (r.src_index, r.start, r.end)));
+                for r in refs {
+                    add(r.src_index, r.start, r.end);
+                }
             }
             if let Some(d) = self.decls.get(&cid) {
-                spans.push((d.src_index, d.name_start, d.name_end));
+                add(d.src_index, d.name_start, d.name_end);
             }
         }
         spans.sort_unstable();
@@ -1328,6 +1341,32 @@ mod tests {
         let edits = edits_for(&edit, &uri);
         assert_eq!(edits.len(), 3, "base decl + override decl + call site");
         assert_eq!(apply(text, edits), "function bar(){}\nfunction bar(){}\nbar();");
+    }
+
+    #[test]
+    fn rename_skips_import_alias_use_sites() {
+        // A reference reading `F` that resolves to `Foo` (an import alias) must not
+        // be rewritten when renaming `Foo` — only spans that still spell `Foo` are.
+        let text = "contract Foo{}\nFoo x;\nF y;";
+        let ast = json!({
+            "id": 1, "nodeType": "SourceUnit", "src": "0:26:0",
+            "nodes": [
+                { "id": 10, "nodeType": "ContractDefinition", "name": "Foo",
+                  "nameLocation": "9:3:0", "src": "0:14:0", "nodes": [] },
+                { "id": 20, "nodeType": "Identifier", "name": "Foo",
+                  "src": "15:3:0", "referencedDeclaration": 10 },
+                { "id": 30, "nodeType": "Identifier", "name": "F",
+                  "src": "22:1:0", "referencedDeclaration": 10 }
+            ]
+        });
+        let path = "/no-such-dir-solidity-lsp/A.sol";
+        let idx = Index::build(&[src(1, path, text, ast)]);
+        let p = Path::new(path);
+        let edit = idx.rename(p, Position::new(0, 9), "Bar").unwrap();
+        let uri = Url::from_file_path(p).unwrap();
+        let edits = edits_for(&edit, &uri);
+        assert_eq!(edits.len(), 2, "declaration + the `Foo` use, not the `F` alias");
+        assert_eq!(apply(text, edits), "contract Bar{}\nBar x;\nF y;");
     }
 
     #[test]
