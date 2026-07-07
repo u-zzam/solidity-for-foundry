@@ -26,24 +26,63 @@ const KEYWORDS: &[&str] = &[
     "enum", "error", "event", "external", "fallback", "for", "from", "function", "if", "immutable",
     "import", "indexed", "interface", "internal", "is", "library", "mapping", "memory", "modifier",
     "new", "override", "payable", "pragma", "private", "public", "pure", "receive", "return",
-    "returns", "revert", "storage", "string", "struct", "try", "type", "uint256", "unchecked",
+    "returns", "revert", "storage", "string", "struct", "try", "type", "unchecked",
     "using", "view", "virtual", "while",
 ];
 
-/// Solidity keyword and elementary-type completions.
+/// The ether/time unit literals and the boolean literals.
+const LITERALS: &[&str] = &[
+    "true", "false", "wei", "gwei", "ether", "seconds", "minutes", "hours", "days", "weeks",
+];
+
+/// The sized elementary types `uint8..uint256`, `int8..int256` (step 8) and
+/// `bytes1..bytes32`, generated rather than spelled out.
+fn sized_types() -> Vec<String> {
+    let mut out = Vec::new();
+    for bits in (8..=256).step_by(8) {
+        out.push(format!("uint{bits}"));
+        out.push(format!("int{bits}"));
+    }
+    for n in 1..=32 {
+        out.push(format!("bytes{n}"));
+    }
+    out
+}
+
+/// Whether `word` is a sized elementary type (`uint128`, `int8`, `bytes32`).
+fn is_sized_type(word: &str) -> bool {
+    // Reject a leading zero (`uint08`) so only the canonical spelling matches.
+    fn suffix(word: &str, prefix: &str) -> Option<u32> {
+        let n = word.strip_prefix(prefix)?;
+        if n.is_empty() || (n.len() > 1 && n.starts_with('0')) {
+            return None;
+        }
+        n.parse().ok()
+    }
+    if let Some(n) = suffix(word, "uint").or_else(|| suffix(word, "int")) {
+        return (8..=256).contains(&n) && n % 8 == 0;
+    }
+    suffix(word, "bytes").is_some_and(|n| (1..=32).contains(&n))
+}
+
+/// Solidity keyword and elementary-type completions: the keywords, the sized
+/// types, and the boolean/unit literals.
 pub fn keywords() -> Vec<CompletionItem> {
-    KEYWORDS.iter().map(|k| item(k, CompletionItemKind::KEYWORD, "")).collect()
+    KEYWORDS
+        .iter()
+        .map(|k| item(k, CompletionItemKind::KEYWORD, ""))
+        .chain(sized_types().iter().map(|t| item(t, CompletionItemKind::KEYWORD, "")))
+        .chain(LITERALS.iter().map(|l| item(l, CompletionItemKind::CONSTANT, "")))
+        .collect()
 }
 
 /// Whether `word` is a keyword, reserved word or builtin literal, so it can't be
 /// the new name in a rename.
 pub fn is_reserved(word: &str) -> bool {
     KEYWORDS.contains(&word)
-        || matches!(
-            word,
-            "true" | "false" | "wei" | "gwei" | "ether" | "seconds" | "minutes" | "hours" | "days"
-                | "weeks" | "years" | "this" | "super" | "now" | "msg" | "block" | "tx" | "abi"
-        )
+        || LITERALS.contains(&word)
+        || is_sized_type(word)
+        || matches!(word, "years" | "this" | "super" | "now" | "msg" | "block" | "tx" | "abi")
 }
 
 /// Global builtin functions and magic objects (`require`, `keccak256`, `msg`, …).
@@ -315,6 +354,26 @@ mod tests {
         // A closed string, or a non-import line, is not import context.
         assert_eq!(import_path_context("import \"./A.sol\";", 16), None);
         assert_eq!(import_path_context("uint x = 1;", 11), None);
+    }
+
+    #[test]
+    fn sized_types_units_and_booleans_are_offered() {
+        let ks = keywords();
+        let has = |l: &str| ks.iter().any(|i| i.label == l);
+        for l in [
+            "uint8", "uint128", "uint256", "int8", "int256", "bytes1", "bytes32", "true", "false",
+            "wei", "gwei", "ether", "seconds", "days",
+        ] {
+            assert!(has(l), "missing {l}");
+        }
+        // Out-of-range or non-step spellings are never generated.
+        for l in ["uint257", "uint0", "int7", "bytes0", "bytes33"] {
+            assert!(!has(l), "unexpected {l}");
+        }
+        // Sized types are reserved, so a rename can't target one.
+        assert!(is_sized_type("uint128") && is_sized_type("bytes32") && is_sized_type("int8"));
+        assert!(!is_sized_type("uint7") && !is_sized_type("uint08") && !is_sized_type("bytes33"));
+        assert!(is_reserved("uint256") && is_reserved("true") && is_reserved("wei"));
     }
 
     #[test]
