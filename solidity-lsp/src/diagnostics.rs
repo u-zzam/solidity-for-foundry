@@ -186,6 +186,11 @@ pub fn group(errors: &[SolcError], root: &Path, fallback: &Url) -> HashMap<Url, 
 /// located in `target` are returned (that's all a live check publishes).
 pub fn for_buffer(errors: &[SolcError], root: &Path, target: &Url, buffer: &str) -> Vec<Diagnostic> {
     let mapper = PositionMapper::new(buffer);
+    // Match by file identity, not by a re-serialized URI: on Windows the client
+    // sends `file:///c%3A/...` (percent-encoded, lowercase drive) while
+    // `Url::from_file_path` yields `file:///C:/...`, so a raw URI compare drops
+    // every error in the edited file and no live squiggle is ever published.
+    let target_id = target.to_file_path().ok().map(|p| crate::project::path_identity(&p));
     errors
         .iter()
         .filter(|err| match &err.source_location {
@@ -193,7 +198,8 @@ pub fn for_buffer(errors: &[SolcError], root: &Path, target: &Url, buffer: &str)
             // to the edited file at the top, rather than vanishing.
             None => true,
             Some(loc) => {
-                Url::from_file_path(root.join(&loc.file)).ok().is_some_and(|uri| uri == *target)
+                target_id.as_deref()
+                    == Some(crate::project::path_identity(&root.join(&loc.file)).as_path())
             }
         })
         .map(|err| to_diagnostic(err, &mapper, target))

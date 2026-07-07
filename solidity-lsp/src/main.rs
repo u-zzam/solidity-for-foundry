@@ -189,27 +189,50 @@ impl Backend {
             .await;
 
         let mut published = self.state.published.lock().await;
-        // Files this on-disk compile reported on. Dirty buffers stay seeded here
-        // but are not republished below — the live buffer check owns them.
-        let mut next: HashSet<Url> = new.keys().cloned().collect();
+        // An open file may have been opened under a different URI spelling than
+        // the one solc reports (Windows sends a percent-encoded / differently-
+        // cased drive). Publish — and later clear — each open file under the
+        // client's own URI, so an empty publish actually clears what the editor
+        // shows. Files no client has open keep the compile's reconstructed URI.
+        let open_uris: HashMap<PathBuf, Url> = {
+            let docs = self.state.docs.read().await;
+            docs.keys()
+                .filter_map(|u| u.to_file_path().ok().map(|p| (project::path_identity(&p), u.clone())))
+                .collect()
+        };
+        let for_client = |uri: &Url| -> Url {
+            uri.to_file_path()
+                .ok()
+                .and_then(|p| open_uris.get(&project::path_identity(&p)).cloned())
+                .unwrap_or_else(|| uri.clone())
+        };
+        // Identities of the files this compile actually re-checked, matched by
+        // file identity so a Windows drive-case difference doesn't hide a hit.
+        let compiled_ids: HashSet<PathBuf> =
+            compiled.iter().map(|p| project::path_identity(p)).collect();
+
+        // Files this on-disk compile reported on (under the client's URI). Dirty
+        // buffers stay seeded here but are not republished below — the live buffer
+        // check owns them.
+        let mut next: HashSet<Url> = HashSet::new();
         for (uri, diags) in &new {
+            let uri = for_client(uri);
+            next.insert(uri.clone());
             // Skip files with unsaved edits: their squiggles come from the live
             // buffer check against the in-memory text. Publishing disk-mapped
             // ranges here would jump them to stale offsets (and briefly resurrect
             // a just-fixed error) until the next keystroke.
-            if self.is_dirty(uri).await {
+            if self.is_dirty(&uri).await {
                 continue;
             }
-            self.client
-                .publish_diagnostics(uri.clone(), diags.clone(), None)
-                .await;
+            self.client.publish_diagnostics(uri, diags.clone(), None).await;
         }
         // Clear files that had diagnostics last time but are clean now — except
         // files with unsaved edits, whose squiggles are owned by the live buffer
         // check (this on-disk compile would otherwise wipe them until the next
         // keystroke).
         for uri in published.iter() {
-            if new.contains_key(uri) {
+            if next.contains(uri) {
                 continue;
             }
             // Only clear a file this compile actually re-checked. A warm-cache
@@ -218,7 +241,8 @@ impl Backend {
             // re-emits none); another root's or a standalone file's diagnostics
             // are likewise left intact. A genuine fix always recompiles the
             // edited file, so real fixes still clear.
-            let recompiled = uri.to_file_path().is_ok_and(|p| compiled.contains(&p));
+            let recompiled =
+                uri.to_file_path().is_ok_and(|p| compiled_ids.contains(&project::path_identity(&p)));
             if !recompiled || self.is_dirty(uri).await {
                 next.insert(uri.clone());
                 continue;
@@ -247,12 +271,28 @@ impl Backend {
     /// Whether `uri` has an open buffer that differs from its on-disk content
     /// (so the live check, not an on-disk compile, owns its diagnostics).
     async fn is_dirty(&self, uri: &Url) -> bool {
-        let Some(buffer) = self.state.docs.read().await.get(uri).cloned() else {
-            return false;
-        };
         let Ok(path) = uri.to_file_path() else {
             return false;
         };
+        let docs = self.state.docs.read().await;
+        let buffer = match docs.get(uri) {
+            Some(b) => b.clone(),
+            // The compile/clear paths can hand us a differently-spelled URI for an
+            // open file (Windows: percent-encoded vs literal drive colon, or
+            // drive-letter case), so fall back to matching by file identity
+            // before concluding the file has no open buffer.
+            None => {
+                let id = project::path_identity(&path);
+                match docs
+                    .iter()
+                    .find(|(u, _)| u.to_file_path().ok().is_some_and(|p| project::path_identity(&p) == id))
+                {
+                    Some((_, b)) => b.clone(),
+                    None => return false,
+                }
+            }
+        };
+        drop(docs);
         // A buffer with no readable file on disk is unsaved -> live owns it.
         std::fs::read_to_string(&path).map_or(true, |disk| disk != buffer)
     }

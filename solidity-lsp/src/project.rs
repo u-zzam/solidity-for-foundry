@@ -653,16 +653,16 @@ pub fn check_buffer(
     // from `buffer`, any other open file from `open`. Checking against stale disk
     // for an imported-but-unsaved file produced phantom errors ("member not
     // found", …) until that file was saved.
-    let norm_target = normalize_path(target);
-    let open_norm: HashMap<PathBuf, &str> =
-        open.iter().map(|(p, t)| (normalize_path(p), t.as_str())).collect();
+    let target_id = path_identity(target);
+    let open_ids: HashMap<PathBuf, &str> =
+        open.iter().map(|(p, t)| (path_identity(p), t.as_str())).collect();
     let mut found = false;
     for (p, source) in input.sources.iter_mut() {
-        let abs = normalize_path(&if p.is_absolute() { p.clone() } else { root.join(p) });
-        if abs == norm_target {
+        let abs = path_identity(&if p.is_absolute() { p.clone() } else { root.join(p) });
+        if abs == target_id {
             *source = Source::new(buffer);
             found = true;
-        } else if let Some(text) = open_norm.get(&abs) {
+        } else if let Some(text) = open_ids.get(&abs) {
             *source = Source::new(*text);
         }
     }
@@ -866,6 +866,30 @@ fn normalize_path(p: &Path) -> PathBuf {
     out
 }
 
+/// A stable identity for a filesystem path, so different spellings of the same
+/// file compare equal: a percent-encoded vs literal drive colon (once both are
+/// decoded through `to_file_path`), `.`/`..` segments, and `c:` vs `C:`
+/// drive-letter case on Windows. Canonicalizes when the file exists (resolving
+/// symlinks and real case); otherwise a lexical normalize. Used only for
+/// comparison — never for I/O or for a URI published back to the client — so the
+/// canonical form needn't be a "nice" path.
+pub fn path_identity(p: &Path) -> PathBuf {
+    let norm = std::fs::canonicalize(p).unwrap_or_else(|_| normalize_path(p));
+    identity_key(&norm, cfg!(windows))
+}
+
+/// Reduce a normalized path to a comparison key. Windows' filesystem is
+/// case-insensitive, so two drive/letter cases are the same file; elsewhere
+/// paths are case-sensitive and kept verbatim. Split out so the case-folding
+/// rule is unit-testable without a Windows host.
+fn identity_key(norm: &Path, windows: bool) -> PathBuf {
+    if windows {
+        PathBuf::from(norm.as_os_str().to_ascii_lowercase())
+    } else {
+        norm.to_path_buf()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1045,6 +1069,23 @@ mod tests {
         assert_ne!(fp2, source_fingerprint(&root));
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn path_identity_folds_case_only_on_windows() {
+        // Windows' filesystem is case-insensitive: two drive-letter cases name the
+        // same file. Elsewhere paths are case-sensitive and stay distinct.
+        let upper = Path::new("C:/Users/Me/Src/A.sol");
+        let lower = Path::new("c:/users/me/src/a.sol");
+        assert_eq!(identity_key(upper, true), identity_key(lower, true));
+        assert_ne!(identity_key(upper, false), identity_key(lower, false));
+
+        // For a path with no file on disk (canonicalize can't resolve it) the
+        // lexical normalize still folds `.`/`..`, so two spellings of one file
+        // compare equal.
+        let a = path_identity(Path::new("/no-such-solidity-lsp/a/../b/C.sol"));
+        let b = path_identity(Path::new("/no-such-solidity-lsp/b/C.sol"));
+        assert_eq!(a, b);
     }
 
     #[test]
