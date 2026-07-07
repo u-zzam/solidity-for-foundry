@@ -119,9 +119,10 @@ struct Def {
     name_end: usize,
     full_start: usize,
     full_end: usize,
-    /// Enclosing contract/interface/library/struct/enum, for member completion
-    /// and outline nesting.
-    container: Option<String>,
+    /// Index into the file's `defs` of the enclosing container
+    /// (contract/interface/library/struct/enum), for member completion and
+    /// outline nesting. `None` at file level.
+    container: Option<usize>,
     /// A rendered header (`function f(uint a) public`) for hover/completion.
     detail: String,
     /// Ordered parameter names for callables/structs, for call-site inlay hints.
@@ -216,7 +217,7 @@ pub fn parse(text: &str) -> File {
 fn walk<'a>(
     node: Node<'a>,
     src: &[u8],
-    container: Option<&str>,
+    container: Option<usize>,
     defs: &mut Vec<Def>,
     idents: &mut Vec<Ident>,
     calls: &mut Vec<Call>,
@@ -259,22 +260,25 @@ fn walk<'a>(
 
     if let Some((name, kind, ns, ne)) = def_of(node, src) {
         let detail = header(node, src);
+        let index = defs.len();
         defs.push(Def {
-            name: name.clone(),
+            name,
             kind,
             name_start: ns,
             name_end: ne,
             full_start: node.start_byte(),
             full_end: node.end_byte(),
-            container: container.map(str::to_string),
+            container,
             detail,
             params: param_names(node, src),
             type_name: var_type_name(node, src),
             bases: base_names(node, src),
         });
-        // Descend with this node as the container if it is a type scope.
-        let inner = kind.is_container().then_some(name);
-        let child_container = inner.as_deref().or(container);
+        // Descend with this def as the container if it is a type scope. Nesting
+        // by index (not name) stops a member sharing its container's name
+        // (`contract A { struct A {} }`) from re-matching itself and recursing
+        // forever in `nested`.
+        let child_container = if kind.is_container() { Some(index) } else { container };
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
             walk(child, src, child_container, defs, idents, calls, imports);
@@ -620,14 +624,15 @@ pub fn document_symbols(file: &File) -> Vec<DocumentSymbol> {
     nested(&file.defs, None, &m)
 }
 
-fn nested(defs: &[Def], parent: Option<&str>, m: &PositionMapper) -> Vec<DocumentSymbol> {
+fn nested(defs: &[Def], parent: Option<usize>, m: &PositionMapper) -> Vec<DocumentSymbol> {
     defs.iter()
-        .filter(|d| d.container.as_deref() == parent)
-        .map(|d| {
+        .enumerate()
+        .filter(|(_, d)| d.container == parent)
+        .map(|(i, d)| {
             let children = d
                 .kind
                 .is_container()
-                .then(|| nested(defs, Some(&d.name), m))
+                .then(|| nested(defs, Some(i), m))
                 .filter(|c| !c.is_empty());
             let selection = Range::new(m.position(d.name_start), m.position(d.name_end));
             let mut range = Range::new(m.position(d.full_start), m.position(d.full_end));
@@ -669,7 +674,7 @@ pub fn workspace_symbols(files: &HashMap<Url, File>, query: &str) -> Vec<SymbolI
                 tags: None,
                 deprecated: None,
                 location: location(uri, &f.text, d.name_start, d.name_end),
-                container_name: d.container.clone(),
+                container_name: d.container.map(|i| f.defs[i].name.clone()),
             });
         }
     }
@@ -725,12 +730,14 @@ pub fn member_completions(files: &HashMap<Url, File>, container: &str) -> Vec<Co
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for name in &order {
-        for d in files.values().flat_map(|f| f.defs.iter()) {
-            if d.container.as_deref() == Some(name.as_str())
-                && d.kind.is_member()
-                && seen.insert(d.name.clone())
-            {
-                out.push(completion_for(d));
+        for f in files.values() {
+            for d in &f.defs {
+                if d.container.map(|i| f.defs[i].name.as_str()) == Some(name.as_str())
+                    && d.kind.is_member()
+                    && seen.insert(d.name.clone())
+                {
+                    out.push(completion_for(d));
+                }
             }
         }
     }
@@ -1004,6 +1011,22 @@ contract Token is Base {
         assert!(import_definition(files.get(&uri), &uri, pos_of(src, "Token }")).is_none());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn document_symbols_survive_name_cycles() {
+        // A member sharing its container's name used to recurse forever (nesting
+        // matched by name); nesting by identity terminates.
+        let direct = parse("contract A { struct A { uint256 x; } }");
+        let syms = document_symbols(&direct);
+        let a = syms.iter().find(|s| s.name == "A").unwrap();
+        assert!(a.children.as_ref().unwrap().iter().any(|c| c.name == "A"));
+
+        // The indirect cycle across two contracts, likewise.
+        let indirect =
+            parse("contract A { struct B { uint256 x; } } contract B { struct A { uint256 y; } }");
+        let syms = document_symbols(&indirect);
+        assert_eq!(syms.iter().filter(|s| s.name == "A" || s.name == "B").count(), 2);
     }
 
     #[test]
