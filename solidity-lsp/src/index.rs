@@ -41,6 +41,15 @@ struct Decl {
     /// For a variable/parameter/field of a user-defined type, the declaration id
     /// of that type (its `typeName`'s `referencedDeclaration`), for go-to-type.
     type_decl: Option<i64>,
+    /// Whether this declaration is worth surfacing as a bare name — in
+    /// workspace-symbol search and global (non-member) completion. Contracts,
+    /// callables and types always are; a variable only if it's a state variable
+    /// or a file-level constant, never a local, parameter or struct field. Every
+    /// `nameLocation`-bearing node becomes a Decl, so without this the accurate
+    /// engine would flood those two surfaces with params/locals (dependencies
+    /// included) — noisier than the live parser, which already filters by
+    /// `DefKind::is_global`.
+    navigable: bool,
 }
 
 /// A member of a contract / library / struct / enum, for `.` completion.
@@ -186,6 +195,23 @@ impl Index {
             };
             path_to_index.insert(canon, s.index);
 
+            // Top-level (source-unit) declarations are the ones importable by
+            // name; recorded before the walk so a declaration's `navigable` flag
+            // can tell a file-level constant (surface it) from a struct field or
+            // local (don't).
+            if let Some(nodes) = s.ast.get("nodes").and_then(|n| n.as_array()) {
+                for n in nodes {
+                    if let (Some(id), Some(name)) = (
+                        n.get("id").and_then(|v| v.as_i64()),
+                        n.get("name").and_then(|v| v.as_str()),
+                    ) {
+                        if !name.is_empty() {
+                            top_level.insert(id);
+                        }
+                    }
+                }
+            }
+
             let symbols =
                 doc_symbols(&s.ast, &PositionMapper::with_line_starts(&text, &line_starts));
 
@@ -234,6 +260,18 @@ impl Index {
                                 }
                             }
                         }
+                        // A variable is a bare-name symbol only if it's a state
+                        // variable or a file-level constant — not a local, a
+                        // parameter or a struct field (all `VariableDeclaration`
+                        // with `stateVariable: false` and not top-level).
+                        let navigable = match kind {
+                            "EnumValue" => false,
+                            "VariableDeclaration" => {
+                                map.get("stateVariable").and_then(|v| v.as_bool()).unwrap_or(false)
+                                    || top_level.contains(&id)
+                            }
+                            _ => true,
+                        };
                         decls.entry(id).or_insert_with(|| Decl {
                             src_index: s.index,
                             name_start: start,
@@ -246,6 +284,7 @@ impl Index {
                             param_names: decl_param_names(map),
                             doc: documentation(map),
                             type_decl: type_ref(map),
+                            navigable,
                         });
                         return;
                     }
@@ -288,19 +327,6 @@ impl Index {
             });
 
             collect_containers(&s.ast, &mut containers);
-            // Top-level (source-unit) declarations are the ones importable by name.
-            if let Some(nodes) = s.ast.get("nodes").and_then(|n| n.as_array()) {
-                for n in nodes {
-                    if let (Some(id), Some(name)) = (
-                        n.get("id").and_then(|v| v.as_i64()),
-                        n.get("name").and_then(|v| v.as_str()),
-                    ) {
-                        if !name.is_empty() {
-                            top_level.insert(id);
-                        }
-                    }
-                }
-            }
             files.insert(
                 s.index,
                 FileEntry {
@@ -589,9 +615,20 @@ impl Index {
     }
 
     pub fn workspace_symbols(&self, query: &str) -> Vec<SymbolInformation> {
+        // Cap results: a short or empty query on a large monorepo would otherwise
+        // return thousands of symbols, and the editor's picker shows only a slice.
+        const CAP: usize = 512;
         let q = query.to_lowercase();
         let mut out = Vec::new();
         for (id, d) in &self.decls {
+            if out.len() >= CAP {
+                break;
+            }
+            // Skip locals, parameters and struct fields — bare-name search wants
+            // navigable declarations, matching the live parser's filter.
+            if !d.navigable {
+                continue;
+            }
             if !q.is_empty() && !d.name.to_lowercase().contains(&q) {
                 continue;
             }
@@ -633,6 +670,7 @@ impl Index {
         let mut seen = HashSet::new();
         self.decls
             .values()
+            .filter(|d| d.navigable)
             .filter(|d| seen.insert(d.name.as_str()))
             .map(|d| CompletionItem {
                 label: d.name.clone(),
@@ -1448,6 +1486,59 @@ mod tests {
         assert!(md.contains("- `amount` — how much"), "{md}");
         assert!(md.contains("**Returns**"), "{md}");
         assert!(md.contains("- success whether it worked"), "{md}");
+    }
+
+    #[test]
+    fn workspace_symbols_and_global_completions_skip_locals_and_params() {
+        // A file-level constant, a contract with a state variable, and a function
+        // with a parameter and a local. Only the constant, contract, state
+        // variable and function are bare-name symbols; the parameter, local and
+        // struct field are not (they'd otherwise swamp Cmd+T and Ctrl+Space).
+        let text = "x";
+        let name_loc = "0:1:0";
+        let ast = json!({
+            "id": 1, "nodeType": "SourceUnit", "src": "0:1:0",
+            "nodes": [
+                { "id": 2, "nodeType": "VariableDeclaration", "name": "TOP",
+                  "nameLocation": name_loc, "src": "0:1:0", "stateVariable": false },
+                { "id": 3, "nodeType": "StructDefinition", "name": "Pt",
+                  "nameLocation": name_loc, "src": "0:1:0", "members": [
+                    { "id": 4, "nodeType": "VariableDeclaration", "name": "fx",
+                      "nameLocation": name_loc, "src": "0:1:0", "stateVariable": false }
+                  ] },
+                { "id": 10, "nodeType": "ContractDefinition", "name": "C",
+                  "nameLocation": name_loc, "src": "0:1:0", "nodes": [
+                    { "id": 11, "nodeType": "VariableDeclaration", "name": "sv",
+                      "nameLocation": name_loc, "src": "0:1:0", "stateVariable": true },
+                    { "id": 12, "nodeType": "FunctionDefinition", "name": "f",
+                      "kind": "function", "nameLocation": name_loc, "src": "0:1:0",
+                      "parameters": { "parameters": [
+                        { "id": 13, "nodeType": "VariableDeclaration", "name": "p",
+                          "nameLocation": name_loc, "src": "0:1:0", "stateVariable": false }
+                      ] },
+                      "body": { "nodeType": "Block", "src": "0:1:0", "statements": [
+                        { "nodeType": "VariableDeclarationStatement", "src": "0:1:0",
+                          "declarations": [
+                            { "id": 14, "nodeType": "VariableDeclaration", "name": "loc",
+                              "nameLocation": name_loc, "src": "0:1:0", "stateVariable": false }
+                          ] }
+                      ] } }
+                  ] }
+            ]
+        });
+        let idx = Index::build(&[src(1, "/no-such-dir-solidity-lsp/A.sol", text, ast)]);
+        let ws: Vec<String> = idx.workspace_symbols("").into_iter().map(|s| s.name).collect();
+        for want in ["TOP", "C", "sv", "f"] {
+            assert!(ws.contains(&want.to_string()), "workspace missing {want}: {ws:?}");
+        }
+        for skip in ["p", "loc", "fx"] {
+            assert!(!ws.contains(&skip.to_string()), "workspace should skip {skip}: {ws:?}");
+        }
+        let gc: Vec<String> = idx.global_completions().into_iter().map(|c| c.label).collect();
+        assert!(gc.contains(&"sv".to_string()) && gc.contains(&"f".to_string()), "{gc:?}");
+        for skip in ["p", "loc", "fx"] {
+            assert!(!gc.contains(&skip.to_string()), "completion should skip {skip}: {gc:?}");
+        }
     }
 
     #[test]
