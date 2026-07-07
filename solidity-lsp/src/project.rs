@@ -531,6 +531,16 @@ fn filter_errors(mut errors: Vec<SolcError>, root: &Path, cfg: &Config) -> Vec<S
     let ignored_codes: HashSet<u64> = cfg.ignored_error_codes.iter().copied().collect();
     let ignored_paths: Vec<PathBuf> = cfg.ignored_warnings_from.iter().map(|p| root.join(p)).collect();
     errors.retain(|e| {
+        // Once a compile overflows solc's diagnostic cap it appends a graph-wide
+        // meta notice ("There are more than 256 warnings/errors. Ignoring the
+        // rest.") with no source location — output-truncation metadata, not a
+        // diagnostic for any file. Drop it before the error check below (the
+        // errors variant has severity Error). Match narrowly on the missing
+        // location plus the exact prefix so genuine no-location errors (e.g. a
+        // compiler run failure) still surface.
+        if e.source_location.is_none() && e.message.starts_with("There are more than 256") {
+            return false;
+        }
         // `skip` drops a file from the build entirely, so forge reports none of
         // its diagnostics — errors too. Match before the error check below.
         if !cfg.skip.is_empty() {
@@ -1203,5 +1213,41 @@ mod tests {
             remappings.iter().map(|r| r.name.clone()).collect::<Vec<_>>()
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn drops_solc_truncation_notice() {
+        use foundry_compilers::artifacts::{error::SourceLocation, Severity};
+
+        fn err(severity: Severity, file: Option<&str>, message: &str) -> SolcError {
+            SolcError {
+                source_location: file.map(|file| SourceLocation {
+                    file: file.to_string(),
+                    start: 0,
+                    end: 1,
+                }),
+                secondary_source_locations: Vec::new(),
+                r#type: String::new(),
+                component: String::new(),
+                severity,
+                error_code: None,
+                message: message.to_string(),
+                formatted_message: None,
+            }
+        }
+
+        let errors = vec![
+            // solc's overflow notice, both severities, no source location.
+            err(Severity::Warning, None, "There are more than 256 warnings. Ignoring the rest."),
+            err(Severity::Error, None, "There are more than 256 errors. Ignoring the rest."),
+            // A genuine no-location fatal error must still surface.
+            err(Severity::Error, None, "Compiler run failed."),
+            // A located warning is untouched.
+            err(Severity::Warning, Some("src/A.sol"), "Unused local variable."),
+        ];
+
+        let kept = filter_errors(errors, Path::new("/tmp"), &Config::default());
+        let messages: Vec<&str> = kept.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(messages, vec!["Compiler run failed.", "Unused local variable."]);
     }
 }
