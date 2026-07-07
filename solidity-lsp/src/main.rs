@@ -445,6 +445,13 @@ impl Backend {
 
         let root = project::locate_root(&path);
         let (r, t, buf) = (root.clone(), path.clone(), buffer.clone());
+        // Bound concurrent solc type-checks. Each is a full-graph solc run that
+        // can take one to several GB; a branch switch or `forge install` used to
+        // fan one out per open tab at once, risking an out-of-memory kill. A few
+        // permits keep as-you-type latency low while capping peak memory.
+        let Ok(_permit) = live_check_semaphore().acquire().await else {
+            return;
+        };
         let errors = tokio::task::spawn_blocking(move || match r {
             Some(r) => project::check_buffer(&r, &t, &buf, &open),
             None => project::check_standalone(&t, &buf),
@@ -1147,8 +1154,7 @@ impl LanguageServer for Backend {
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
         // foundry.toml / remappings.txt edits change a project's config (solc
         // version, remappings, source layout), and a .sol file can change on disk
-        // outside the editor (forge install, branch switch). Re-check and
-        // re-index every open buffer in an affected root. Skip events for .sol
+        // outside the editor (forge install, branch switch). Skip events for .sol
         // files we already have open — did_change / did_save own those, and
         // re-triggering here would double-compile.
         let open: Vec<Url> = self.state.docs.read().await.keys().cloned().collect();
@@ -1168,16 +1174,34 @@ impl LanguageServer for Backend {
         if roots.is_empty() {
             return;
         }
+        // One compile + index per affected root, keyed off any open buffer in it.
+        // The warm incremental compile republishes and clears diagnostics across
+        // the whole project — open and unopened files alike, so files a branch
+        // switch fixed stop showing stale squiggles. Doing this once per root,
+        // instead of a live type-check per open tab, avoids running a dozen solc
+        // processes at once (a memory blowout the old fan-out risked).
+        let mut done: HashSet<PathBuf> = HashSet::new();
         for uri in &open {
             let Ok(p) = uri.to_file_path() else {
                 continue;
             };
-            if project::locate_root(&p).is_some_and(|r| roots.contains(&r)) {
-                self.schedule_live_check_now(uri.clone());
+            let Some(root) = project::locate_root(&p) else {
+                continue;
+            };
+            if roots.contains(&root) && done.insert(root) {
+                self.schedule_diagnostics(uri.clone());
                 self.schedule_index(uri.clone());
             }
         }
     }
+}
+
+/// Globally bounds concurrent as-you-type solc type-checks (`live_check`) across
+/// every open buffer, so a burst — a branch switch or `forge install` touching
+/// many open tabs — can't launch one heavyweight solc process per file at once.
+fn live_check_semaphore() -> &'static tokio::sync::Semaphore {
+    static SEM: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    SEM.get_or_init(|| tokio::sync::Semaphore::new(3))
 }
 
 /// Whether two LSP ranges intersect (touching counts), so a code action is
