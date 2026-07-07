@@ -713,12 +713,25 @@ pub fn remapping_targets(root: &Path) -> Vec<(String, PathBuf)> {
 /// always changes the signature even if its mtime is momentarily unreadable.
 pub fn source_fingerprint(root: &Path) -> u64 {
     use std::hash::{Hash, Hasher};
-    let cfg = parse_config(root);
+    let (cfg, remappings) = config_and_remappings(root);
     let mut files: Vec<(PathBuf, u64, u64)> = Vec::new();
-    let mut dirs = vec![cfg.src, cfg.tests, cfg.scripts];
-    dirs.extend(cfg.libs);
-    for d in dirs {
-        collect_sol(&root.join(d), &mut files);
+    let mut dirs: Vec<PathBuf> = [cfg.src, cfg.tests, cfg.scripts]
+        .into_iter()
+        .chain(cfg.libs)
+        .map(|d| root.join(d))
+        .collect();
+    // A remapping can point outside src/test/script/lib (e.g.
+    // `@oz/=node_modules/@openzeppelin/`); the full compile indexes those
+    // sources, so an on-disk change there must move the fingerprint too. Skip
+    // targets already under a walked dir so lib/ isn't re-walked.
+    for r in &remappings {
+        let target = PathBuf::from(&r.path);
+        if !dirs.iter().any(|d| target.starts_with(d)) {
+            dirs.push(target);
+        }
+    }
+    for d in &dirs {
+        collect_sol(d, &mut files);
     }
     for name in ["foundry.toml", "remappings.txt"] {
         let p = root.join(name);
@@ -1084,6 +1097,29 @@ mod tests {
         // Editing content (longer file) changes it too.
         std::fs::write(src.join("B.sol"), "contract B { uint256 x; }").unwrap();
         assert_ne!(fp2, source_fingerprint(&root));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn source_fingerprint_tracks_remapped_out_of_tree_dirs() {
+        let root = temp_dir();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let dep = root.join("vendor/pkg");
+        std::fs::create_dir_all(&dep).unwrap();
+        // A remapping target outside src/test/script/lib.
+        std::fs::write(
+            root.join("foundry.toml"),
+            "[profile.default]\nremappings = [\"@pkg/=vendor/pkg/\"]\n",
+        )
+        .unwrap();
+        std::fs::write(dep.join("Dep.sol"), "contract Dep {}").unwrap();
+
+        let fp1 = source_fingerprint(&root);
+        // Editing the remapped dependency on disk must move the fingerprint, or a
+        // needed reindex would be skipped and navigation would stay stale.
+        std::fs::write(dep.join("Dep.sol"), "contract Dep { uint256 x; }").unwrap();
+        assert_ne!(fp1, source_fingerprint(&root));
 
         std::fs::remove_dir_all(&root).ok();
     }
