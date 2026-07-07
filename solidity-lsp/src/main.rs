@@ -14,6 +14,11 @@ mod index;
 mod parse;
 mod project;
 
+/// The server-side command a "▶ Run test" code lens invokes. The client library
+/// forwards it to `execute_command` because it's in `executeCommandProvider`, so
+/// no client-side handler is needed.
+const RUN_TEST_COMMAND: &str = "solidity.runTest";
+
 #[derive(Clone)]
 struct Backend {
     client: Client,
@@ -528,6 +533,57 @@ impl Backend {
         }
     }
 
+    /// Run a single Foundry test (`forge test --match-contract C --match-test T
+    /// -vvv`) off the message loop and report it: a status-bar spinner while it
+    /// runs, the full traces to the log channel, and a one-line pass/fail popup.
+    async fn run_forge_test(&self, root: PathBuf, contract: String, test: String) {
+        let token = self.progress_begin(&format!("Running {contract}.{test}")).await;
+        let (r, c, t) = (root, contract.clone(), test.clone());
+        let result = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("forge")
+                .arg("test")
+                .arg("--root")
+                .arg(&r)
+                .arg("--match-contract")
+                .arg(&c)
+                .arg("--match-test")
+                .arg(&t)
+                .arg("-vvv")
+                .output()
+        })
+        .await;
+        self.progress_end(token).await;
+        match result {
+            Ok(Ok(out)) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                self.client
+                    .log_message(
+                        MessageType::INFO,
+                        format!("forge test {contract}.{test}\n{stdout}{stderr}"),
+                    )
+                    .await;
+                let ok = out.status.success();
+                let summary = test_summary(&stdout).unwrap_or_else(|| {
+                    format!("{contract}.{test} {}", if ok { "passed" } else { "failed" })
+                });
+                self.client
+                    .show_message(if ok { MessageType::INFO } else { MessageType::ERROR }, summary)
+                    .await;
+            }
+            Ok(Err(e)) => {
+                self.client
+                    .show_message(MessageType::ERROR, format!("could not run `forge test`: {e}"))
+                    .await;
+            }
+            Err(e) => {
+                self.client
+                    .log_message(MessageType::ERROR, format!("forge test task failed: {e}"))
+                    .await;
+            }
+        }
+    }
+
     /// Run work off the message loop so the server stays responsive. Debounced
     /// and coalesced per root: a burst of opens/saves in one project collapses
     /// into a single whole-project compile after editing settles, rather than
@@ -769,6 +825,11 @@ impl LanguageServer for Backend {
                     ..Default::default()
                 }),
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+                code_lens_provider: Some(CodeLensOptions { resolve_provider: Some(false) }),
+                execute_command_provider: Some(ExecuteCommandOptions {
+                    commands: vec![RUN_TEST_COMMAND.to_string()],
+                    work_done_progress_options: Default::default(),
+                }),
                 inlay_hint_provider: inlay_hints.then_some(OneOf::Left(true)),
                 semantic_tokens_provider: Some(
                     SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
@@ -1232,6 +1293,64 @@ impl LanguageServer for Backend {
         Ok((!actions.is_empty()).then_some(actions))
     }
 
+    async fn code_lens(&self, params: CodeLensParams) -> Result<Option<Vec<CodeLens>>> {
+        let uri = params.text_document.uri;
+        // Only Foundry test files carry run-test lenses.
+        if !uri.path().ends_with(".t.sol") {
+            return Ok(None);
+        }
+        let parsed = self.state.parsed.read().await;
+        let Some(file) = parsed.get(&uri) else {
+            return Ok(None);
+        };
+        let lenses: Vec<CodeLens> = parse::test_lenses(file)
+            .into_iter()
+            .map(|t| CodeLens {
+                range: t.range,
+                command: Some(Command {
+                    title: "\u{25b6} Run test".to_string(),
+                    command: RUN_TEST_COMMAND.to_string(),
+                    arguments: Some(vec![
+                        serde_json::Value::String(uri.to_string()),
+                        serde_json::Value::String(t.contract),
+                        serde_json::Value::String(t.function),
+                    ]),
+                }),
+                data: None,
+            })
+            .collect();
+        Ok((!lenses.is_empty()).then_some(lenses))
+    }
+
+    async fn execute_command(
+        &self,
+        params: ExecuteCommandParams,
+    ) -> Result<Option<serde_json::Value>> {
+        if params.command != RUN_TEST_COMMAND {
+            return Ok(None);
+        }
+        let arg = |i: usize| params.arguments.get(i).and_then(|v| v.as_str()).map(str::to_string);
+        let (Some(uri), Some(contract), Some(test)) = (arg(0), arg(1), arg(2)) else {
+            return Ok(None);
+        };
+        let root = Url::parse(&uri)
+            .ok()
+            .and_then(|u| u.to_file_path().ok())
+            .and_then(|p| project::locate_root(&p));
+        match root {
+            Some(root) => self.run_forge_test(root, contract, test).await,
+            None => {
+                self.client
+                    .show_message(
+                        MessageType::ERROR,
+                        "No foundry.toml found for this test".to_string(),
+                    )
+                    .await;
+            }
+        }
+        Ok(None)
+    }
+
     async fn semantic_tokens_full(
         &self,
         params: SemanticTokensParams,
@@ -1509,6 +1628,17 @@ impl LanguageServer for Backend {
 fn live_check_semaphore() -> &'static tokio::sync::Semaphore {
     static SEM: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
     SEM.get_or_init(|| tokio::sync::Semaphore::new(3))
+}
+
+/// A one-line result from `forge test` output: the per-test `[PASS]`/`[FAIL…]`
+/// line, else the suite-result line, for a concise pass/fail popup.
+fn test_summary(stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("[PASS]") || l.starts_with("[FAIL"))
+        .or_else(|| stdout.lines().map(str::trim).find(|l| l.starts_with("Suite result")))
+        .map(str::to_string)
 }
 
 /// Whether two LSP ranges intersect (touching counts), so a code action is
@@ -2135,6 +2265,22 @@ mod tests {
         // Skip: a mapping can only live in storage.
         let map = "mapping(uint => uint) x";
         assert!(solc_quickfix(&diag(6651, "", map, (0, map.len())), map).is_none());
+    }
+
+    #[test]
+    fn test_summary_extracts_result_line() {
+        let pass = "Compiling...\nRan 1 test\n[PASS] test_Inc() (gas: 100)\nSuite result: ok. 1 passed";
+        assert_eq!(super::test_summary(pass).as_deref(), Some("[PASS] test_Inc() (gas: 100)"));
+        let fail = "[FAIL. Reason: assertion failed] test_X() (gas: 200)\n";
+        assert_eq!(
+            super::test_summary(fail).as_deref(),
+            Some("[FAIL. Reason: assertion failed] test_X() (gas: 200)")
+        );
+        // No per-test line: fall back to the suite-result line.
+        let suite = "Ran 0 tests\nSuite result: ok. 0 passed; 0 failed";
+        assert_eq!(super::test_summary(suite).as_deref(), Some("Suite result: ok. 0 passed; 0 failed"));
+        // Nothing recognizable yields None (the caller then reports pass/fail).
+        assert_eq!(super::test_summary("Compiling...\n"), None);
     }
 
     #[test]

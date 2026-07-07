@@ -974,6 +974,36 @@ fn param_labels(detail: &str, names: &[String]) -> Vec<String> {
     }
 }
 
+/// A "▶ Run test" code-lens target: a Foundry `test*`/`invariant*` function, the
+/// contract that declares it, and the range to anchor the lens on. Fuzz tests
+/// (with parameters) are included — they run the same way via `--match-test`.
+pub struct TestLens {
+    pub contract: String,
+    pub function: String,
+    pub range: Range,
+}
+
+/// Foundry test/invariant functions in `file`, for a `*.t.sol` file's run-test
+/// code lenses. Only functions declared directly inside a contract qualify (a
+/// library or file-level function is never a Foundry test). Analysis is ~free:
+/// the parser already carries each def's name, container and span.
+pub fn test_lenses(file: &File) -> Vec<TestLens> {
+    let m = PositionMapper::new(&file.text);
+    file.defs
+        .iter()
+        .filter(|d| d.kind == DefKind::Function)
+        .filter(|d| d.name.starts_with("test") || d.name.starts_with("invariant"))
+        .filter_map(|d| {
+            let contract = &file.defs[d.container?];
+            (contract.kind == DefKind::Contract).then(|| TestLens {
+                contract: contract.name.clone(),
+                function: d.name.clone(),
+                range: Range::new(m.position(d.name_start), m.position(d.name_end)),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1308,6 +1338,33 @@ contract Factory {
             .collect();
         assert!(labels.contains(&"supply:".to_string()), "{labels:?}");
         assert!(labels.contains(&"owner:".to_string()), "{labels:?}");
+    }
+
+    #[test]
+    fn test_lenses_target_only_contract_test_functions() {
+        const SRC: &str = r#"
+contract CounterTest {
+    function setUp() public {}
+    function test_Increment() public {}
+    function testFuzz_Add(uint256 x) public {}
+    function invariant_Balance() public {}
+    function helper() internal {}
+}
+library L { function testThing() public {} }
+"#;
+        let file = parse(SRC);
+        let names: Vec<String> =
+            test_lenses(&file).into_iter().map(|l| l.function).collect();
+        // test*, testFuzz* and invariant* functions in a contract get a lens.
+        for want in ["test_Increment", "testFuzz_Add", "invariant_Balance"] {
+            assert!(names.contains(&want.to_string()), "missing {want}: {names:?}");
+        }
+        // setUp, non-test helpers, and functions in a library do not.
+        for skip in ["setUp", "helper", "testThing"] {
+            assert!(!names.contains(&skip.to_string()), "should skip {skip}: {names:?}");
+        }
+        // The enclosing contract is captured for --match-contract.
+        assert!(test_lenses(&file).iter().all(|l| l.contract == "CounterTest"));
     }
 
     #[test]
