@@ -90,8 +90,8 @@ impl Backend {
 
         let _guard = self.state.compiling.lock().await;
         let r = root.clone();
-        let errors = match tokio::task::spawn_blocking(move || project::compile(&r, false)).await {
-            Ok(Ok(out)) => out.errors,
+        let (errors, compiled) = match tokio::task::spawn_blocking(move || project::compile(&r, false)).await {
+            Ok(Ok(out)) => (out.errors, out.compiled),
             Ok(Err(e)) => {
                 self.client
                     .log_message(MessageType::ERROR, format!("compile failed: {e}"))
@@ -157,11 +157,14 @@ impl Backend {
             if new.contains_key(uri) {
                 continue;
             }
-            // Diagnostics for another project (or a standalone file) live in the
-            // same global set; this compile said nothing about them, so preserve
-            // them rather than wiping a different root's squiggles.
-            let outside_root = uri.to_file_path().map_or(true, |p| !p.starts_with(&root));
-            if outside_root || self.is_dirty(uri).await {
+            // Only clear a file this compile actually re-checked. A warm-cache
+            // hit isn't in `compiled`, so its still-valid warnings survive
+            // (foundry's cache doesn't persist diagnostics, so a cache-hit file
+            // re-emits none); another root's or a standalone file's diagnostics
+            // are likewise left intact. A genuine fix always recompiles the
+            // edited file, so real fixes still clear.
+            let recompiled = uri.to_file_path().is_ok_and(|p| compiled.contains(&p));
+            if !recompiled || self.is_dirty(uri).await {
                 next.insert(uri.clone());
                 continue;
             }

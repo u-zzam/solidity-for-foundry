@@ -36,6 +36,12 @@ pub struct SourceAst {
 pub struct CompileOutput {
     pub errors: Vec<SolcError>,
     pub sources: Vec<SourceAst>,
+    /// Absolute paths solc actually ran this compile. A warm incremental
+    /// compile omits unchanged files (their diagnostics aren't re-emitted, and
+    /// foundry's cache doesn't persist them), so diagnostics use this to clear
+    /// and replace only what was really re-checked, leaving cache-hit files'
+    /// still-valid warnings in place.
+    pub compiled: HashSet<PathBuf>,
 }
 
 /// solc warning codes `forge build` suppresses by default: license (1878),
@@ -431,10 +437,12 @@ pub fn compile(root: &Path, full: bool) -> Result<CompileOutput, String> {
     let output = project.compile().map_err(|e| e.to_string())?.into_output();
 
     let mut sources = Vec::new();
+    let mut compiled = HashSet::new();
     for (path, sf) in output.sources.sources() {
+        let abs = if path.is_absolute() { path.clone() } else { root.join(path) };
+        compiled.insert(abs.clone());
         if let Some(ast) = &sf.ast {
             if let Ok(value) = serde_json::to_value(ast) {
-                let abs = if path.is_absolute() { path.clone() } else { root.join(path) };
                 let Ok(text) = std::fs::read_to_string(&abs) else {
                     continue;
                 };
@@ -443,7 +451,7 @@ pub fn compile(root: &Path, full: bool) -> Result<CompileOutput, String> {
         }
     }
     let errors = filter_errors(output.errors, root, &cfg);
-    Ok(CompileOutput { errors, sources })
+    Ok(CompileOutput { errors, sources, compiled })
 }
 
 /// Type-check the unsaved `buffer` for `target` against the project's imports,
