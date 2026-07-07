@@ -467,10 +467,17 @@ impl Index {
         self.location(imp.target, 0, 0)
     }
 
-    pub fn references(&self, path: &Path, pos: Position, include_decl: bool) -> Vec<Location> {
-        let Some(id) = self.resolve(path, pos) else {
-            return Vec::new();
-        };
+    /// References to the symbol under the cursor, or `None` when the cursor
+    /// doesn't resolve to a known declaration. `Some(empty)` is a definitive "no
+    /// references" (an unused declaration) and must not be confused with the
+    /// unresolved case: only the latter should fall back to name matching.
+    pub fn references(
+        &self,
+        path: &Path,
+        pos: Position,
+        include_decl: bool,
+    ) -> Option<Vec<Location>> {
+        let id = self.resolve(path, pos)?;
         let mut out = Vec::new();
         if let Some(refs) = self.refs_by_decl.get(&id) {
             out.extend(refs.iter().filter_map(|r| self.location(r.src_index, r.start, r.end)));
@@ -480,7 +487,7 @@ impl Index {
                 out.push(loc);
             }
         }
-        out
+        Some(out)
     }
 
     /// Markdown hover: a signature code block plus any NatSpec.
@@ -1262,7 +1269,7 @@ mod tests {
         let idx = Index::build(&[src(1, path, text, ast)]);
         let p = Path::new(path);
         let use_pos = Position::new(1, 11); // on the `Foo` type use
-        assert_eq!(idx.references(p, use_pos, false).len(), 1);
+        assert_eq!(idx.references(p, use_pos, false).unwrap().len(), 1);
 
         let edit = idx.rename(p, use_pos, "Bar").unwrap();
         let uri = Url::from_file_path(p).unwrap();
@@ -1311,13 +1318,36 @@ mod tests {
         let idx = Index::build(&[src(1, path, text, ast)]);
         let p = Path::new(path);
         let s_pos = Position::new(1, 13); // on the `S` in `L.S`
-        assert_eq!(idx.references(p, s_pos, false).len(), 1);
+        assert_eq!(idx.references(p, s_pos, false).unwrap().len(), 1);
         let edit = idx.rename(p, s_pos, "T").unwrap();
         let uri = Url::from_file_path(p).unwrap();
         assert_eq!(
             apply(text, edits_for(&edit, &uri)),
             "library L{struct T{}}\ncontract C{L.T a;}"
         );
+    }
+
+    #[test]
+    fn references_none_only_when_unresolved() {
+        // An unused struct: the cursor on its name resolves but there are zero
+        // references. That is `Some(empty)` — a definitive "no refs", distinct
+        // from `None` (couldn't resolve), which is the only case the handler may
+        // fall back to name matching for.
+        let text = "struct Foo{}";
+        let ast = json!({
+            "id": 1, "nodeType": "SourceUnit", "src": "0:12:0",
+            "nodes": [
+                { "id": 10, "nodeType": "StructDefinition", "name": "Foo",
+                  "nameLocation": "7:3:0", "src": "0:12:0", "members": [] }
+            ]
+        });
+        let path = "/no-such-dir-solidity-lsp/A.sol";
+        let idx = Index::build(&[src(1, path, text, ast)]);
+        let p = Path::new(path);
+        // On `Foo`: resolves, zero references.
+        assert_eq!(idx.references(p, Position::new(0, 7), false), Some(Vec::new()));
+        // On the trailing `}`: nothing resolves.
+        assert_eq!(idx.references(p, Position::new(0, 11), false), None);
     }
 
     #[test]

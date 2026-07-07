@@ -581,9 +581,12 @@ impl LanguageServer for Backend {
             if let Ok(path) = uri.to_file_path() {
                 let guard = self.state.index.read().await;
                 if let Some(idx) = guard.get(&root) {
-                    let locs = idx.references(&path, p.position, include);
-                    if !locs.is_empty() {
-                        return Ok(Some(locs));
+                    // A resolved symbol answers definitively — even zero refs is
+                    // correct and must not fall back to name matching, which would
+                    // resurrect unrelated same-named occurrences. Only an
+                    // unresolved cursor (None) drops to the parser below.
+                    if let Some(locs) = idx.references(&path, p.position, include) {
+                        return Ok((!locs.is_empty()).then_some(locs));
                     }
                 }
             }
