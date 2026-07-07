@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, RwLock};
@@ -264,9 +265,15 @@ impl Backend {
         }
     }
 
-    /// Begin a work-done progress (shown in the editor's status bar).
+    /// Begin a work-done progress (shown in the editor's status bar). Each call
+    /// mints a unique token: indexing runs single-flight per root but several
+    /// roots index concurrently, and reusing one token would make the second
+    /// `Create` a protocol violation and let the first `End` dismiss the other
+    /// root's still-running spinner.
     async fn progress_begin(&self, title: &str) -> ProgressToken {
-        let token = ProgressToken::String("solidity/indexing".to_string());
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let token = ProgressToken::String(format!("solidity/indexing/{n}"));
         let _ = self
             .client
             .send_request::<request::WorkDoneProgressCreate>(WorkDoneProgressCreateParams {
