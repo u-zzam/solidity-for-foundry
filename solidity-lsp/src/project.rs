@@ -228,6 +228,9 @@ struct Config {
     ignored_error_codes: Vec<u64>,
     /// Explicit remappings declared inline in foundry.toml.
     remappings: Vec<String>,
+    /// `skip` globs: files forge excludes from the build entirely (typically
+    /// ones that don't compile), so none of their diagnostics surface.
+    skip: Vec<String>,
 }
 
 impl Default for Config {
@@ -245,8 +248,41 @@ impl Default for Config {
             ignored_warnings_from: Vec::new(),
             ignored_error_codes: DEFAULT_IGNORED_CODES.to_vec(),
             remappings: Vec::new(),
+            skip: Vec::new(),
         }
     }
+}
+
+/// Match a root-relative `path` against a foundry `skip` glob. `*`/`**` match any
+/// run of characters (crossing `/`, as forge's default globset does) and `?`
+/// matches one; other glob syntax (`[...]`, `{a,b}`) is treated literally — the
+/// `skip` patterns projects use to exclude non-compiling files are simple.
+fn glob_match(pat: &str, path: &str) -> bool {
+    let (p, t) = (pat.as_bytes(), path.as_bytes());
+    let (mut pi, mut ti) = (0, 0);
+    let (mut star, mut mark) = (None, 0);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == b'?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            while pi < p.len() && p[pi] == b'*' {
+                pi += 1;
+            }
+            star = Some(pi);
+            mark = ti;
+        } else if let Some(s) = star {
+            pi = s;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 fn parse_config(root: &Path) -> Config {
@@ -337,6 +373,9 @@ fn config_for(root: &Path, profile: &str) -> Config {
     if let Some(arr) = p.get("remappings").and_then(|v| v.as_array()) {
         cfg.remappings = arr.iter().filter_map(|v| v.as_str()).map(String::from).collect();
     }
+    if let Some(arr) = p.get("skip").and_then(|v| v.as_array()) {
+        cfg.skip = arr.iter().filter_map(|v| v.as_str()).map(String::from).collect();
+    }
     cfg
 }
 
@@ -417,6 +456,16 @@ fn filter_errors(mut errors: Vec<SolcError>, root: &Path, cfg: &Config) -> Vec<S
     let ignored_codes: HashSet<u64> = cfg.ignored_error_codes.iter().copied().collect();
     let ignored_paths: Vec<PathBuf> = cfg.ignored_warnings_from.iter().map(|p| root.join(p)).collect();
     errors.retain(|e| {
+        // `skip` drops a file from the build entirely, so forge reports none of
+        // its diagnostics — errors too. Match before the error check below.
+        if !cfg.skip.is_empty() {
+            if let Some(loc) = &e.source_location {
+                let rel = loc.file.replace('\\', "/");
+                if cfg.skip.iter().any(|g| glob_match(g, &rel)) {
+                    return false;
+                }
+            }
+        }
         if e.severity.is_error() {
             return true;
         }
@@ -654,6 +703,26 @@ mod tests {
         // No pragma, or no concrete x.y.z, yields nothing.
         assert_eq!(detect_solc("contract C {}"), None);
         assert_eq!(detect_solc("pragma solidity ^0.8;"), None);
+    }
+
+    #[test]
+    fn skip_globs_parse_and_match() {
+        // `*`/`**` cross path separators (forge's default globset behavior).
+        assert!(glob_match("test/**", "test/Foo.sol"));
+        assert!(glob_match("*.t.sol", "test/Counter.t.sol"));
+        assert!(glob_match("src/legacy/*.sol", "src/legacy/Old.sol"));
+        assert!(!glob_match("src/legacy/*.sol", "src/current/New.sol"));
+        assert!(glob_match("src/?.sol", "src/A.sol"));
+        assert!(!glob_match("src/?.sol", "src/AB.sol"));
+
+        let root = temp_dir();
+        std::fs::write(
+            root.join("foundry.toml"),
+            "[profile.default]\nskip = [\"test/**\", \"*.t.sol\"]\n",
+        )
+        .unwrap();
+        assert_eq!(config_for(&root, "default").skip, vec!["test/**", "*.t.sol"]);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
