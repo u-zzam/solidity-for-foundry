@@ -817,7 +817,11 @@ impl LanguageServer for Backend {
                     work_done_progress_options: Default::default(),
                 })),
                 completion_provider: Some(CompletionOptions {
-                    trigger_characters: Some(vec![".".to_string()]),
+                    // `.` for member access; `/`, `"`, `'` so `import "@oz/…`
+                    // suggests as you type (the dominant import style).
+                    trigger_characters: Some(
+                        [".", "/", "\"", "'"].iter().map(|s| s.to_string()).collect(),
+                    ),
                     ..Default::default()
                 }),
                 signature_help_provider: Some(SignatureHelpOptions {
@@ -1117,13 +1121,17 @@ impl LanguageServer for Backend {
         let Some(text) = self.state.docs.read().await.get(&uri).cloned() else {
             return Ok(None);
         };
-        let offset = diagnostics::PositionMapper::new(&text).offset(p.position);
+        let mapper = diagnostics::PositionMapper::new(&text);
+        let offset = mapper.offset(p.position);
 
         // Import path: sibling files/dirs relative to this file, plus the
         // project's remapping prefixes. No index or parse needed, but resolving
         // remappings walks lib/ and reading the directory hits disk, so run it
         // off the dispatch task like every other heavy path.
         if let Some(prefix) = complete::import_path_context(&text, offset) {
+            // The fragment already typed inside the quotes, so a remapping-prefix
+            // item can replace all of it rather than being appended after `@`.
+            let edit_range = Range::new(mapper.position(offset - prefix.len()), p.position);
             let uri = uri.clone();
             let items = tokio::task::spawn_blocking(move || {
                 let path = uri.to_file_path().ok();
@@ -1131,13 +1139,23 @@ impl LanguageServer for Backend {
                 let remaps = path
                     .as_deref()
                     .and_then(project::locate_root)
-                    .map(|r| project::remapping_prefixes(&r))
+                    .map(|r| project::remapping_targets(&r))
                     .unwrap_or_default();
-                dir.map(|d| complete::import_completions(&d, &prefix, &remaps)).unwrap_or_default()
+                dir.map(|d| complete::import_completions(&d, &prefix, &remaps, edit_range))
+                    .unwrap_or_default()
             })
             .await
             .unwrap_or_default();
             return Ok((!items.is_empty()).then_some(CompletionResponse::Array(items)));
+        }
+
+        // `/`, `"` and `'` trigger completion only to drive import-path
+        // suggestions; outside an import string they would otherwise pop the whole
+        // keyword list on every division or string quote, so bail.
+        if let Some(ch) = params.context.as_ref().and_then(|c| c.trigger_character.as_deref()) {
+            if matches!(ch, "/" | "\"" | "'") {
+                return Ok(None);
+            }
         }
 
         let container = member_context(&text, offset);

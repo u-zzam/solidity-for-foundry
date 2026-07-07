@@ -4,9 +4,12 @@
 //! These are available the instant a file opens, before the index — or even the
 //! tree-sitter parse — has anything project-specific to offer.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, InsertTextFormat};
+use tower_lsp::lsp_types::{
+    Command, CompletionItem, CompletionItemKind, CompletionTextEdit, InsertTextFormat, Range,
+    TextEdit,
+};
 
 fn item(label: &str, kind: CompletionItemKind, detail: &str) -> CompletionItem {
     CompletionItem {
@@ -172,36 +175,79 @@ pub fn import_path_context(text: &str, offset: usize) -> Option<String> {
     Some(line[q + 1..].to_string())
 }
 
-/// Import-path completions for the partial path under the cursor: sibling `.sol`
-/// files and subdirectories (resolved relative to the importing file), plus the
-/// project's remapping prefixes when the path isn't relative.
-pub fn import_completions(file_dir: &Path, prefix: &str, remappings: &[String]) -> Vec<CompletionItem> {
+/// Re-open the completion popup after an item is accepted, so entering a folder
+/// or a remapping prefix immediately offers what's inside it — a completion-
+/// inserted `/` doesn't fire trigger characters the way a typed one does.
+fn trigger_suggest() -> Command {
+    Command {
+        title: "Suggest".to_string(),
+        command: "editor.action.triggerSuggest".to_string(),
+        arguments: None,
+    }
+}
+
+/// Import-path completions for the partial path under the cursor. For a relative
+/// path (`./`, `../`), the sibling `.sol` files and subdirectories of the
+/// importing file's directory. For a bare path, the project's remapping prefixes
+/// while one is still being typed, then the contents of the remapped directory
+/// once a prefix is entered. `edit_range` spans the opening quote to the cursor:
+/// a remapping prefix (which the editor's word pattern splits on `@`/`/`) needs
+/// an explicit TextEdit or it is appended to the typed fragment (`@@openzeppelin/`).
+pub fn import_completions(
+    file_dir: &Path,
+    prefix: &str,
+    remappings: &[(String, PathBuf)],
+    edit_range: Range,
+) -> Vec<CompletionItem> {
     let mut out = Vec::new();
 
-    // Remapping prefixes (e.g. `@openzeppelin/`) for a bare, non-relative path.
-    if !prefix.starts_with('.') {
-        let frag = prefix;
-        for r in remappings {
-            if r.starts_with(frag) {
-                out.push(item(r, CompletionItemKind::MODULE, "remapping"));
-            }
+    // The directory whose entries to list, if any.
+    let base: Option<PathBuf> = if prefix.starts_with('.') {
+        // Relative to the importing file.
+        let (dir_part, _) = prefix.rsplit_once('/').unwrap_or(("", prefix));
+        Some(file_dir.join(dir_part))
+    } else if let Some((name, target)) = remappings
+        .iter()
+        .filter(|(name, _)| prefix.starts_with(name.as_str()))
+        .max_by_key(|(name, _)| name.len())
+    {
+        // A remapping prefix is entered: list its target dir (joined with any
+        // subpath typed after the prefix), not the importing file's dir.
+        let rest = &prefix[name.len()..];
+        let (sub, _) = rest.rsplit_once('/').unwrap_or(("", rest));
+        Some(target.join(sub))
+    } else {
+        // Still typing the prefix: offer the remapping names that extend it, each
+        // with a full-fragment TextEdit and a re-trigger to open the dir next.
+        for (name, _) in remappings.iter().filter(|(name, _)| name.starts_with(prefix)) {
+            out.push(CompletionItem {
+                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                    range: edit_range,
+                    new_text: name.clone(),
+                })),
+                command: Some(trigger_suggest()),
+                ..item(name, CompletionItemKind::MODULE, "remapping")
+            });
         }
-    }
+        None
+    };
 
-    // Filesystem entries relative to the importing file.
-    let (dir_part, _) = prefix.rsplit_once('/').unwrap_or(("", prefix));
-    let base = file_dir.join(dir_part);
-    if let Ok(entries) = std::fs::read_dir(&base) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') {
-                continue;
-            }
-            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            if is_dir {
-                out.push(item(&format!("{name}/"), CompletionItemKind::FOLDER, ""));
-            } else if name.ends_with(".sol") {
-                out.push(item(&name, CompletionItemKind::FILE, ""));
+    if let Some(base) = base {
+        if let Ok(entries) = std::fs::read_dir(&base) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') {
+                    continue;
+                }
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                if is_dir {
+                    out.push(CompletionItem {
+                        command: Some(trigger_suggest()),
+                        ..item(&format!("{name}/"), CompletionItemKind::FOLDER, "")
+                    });
+                } else if name.ends_with(".sol") {
+                    out.push(item(&name, CompletionItemKind::FILE, ""));
+                }
             }
         }
     }
@@ -219,6 +265,26 @@ mod tests {
         // A closed string, or a non-import line, is not import context.
         assert_eq!(import_path_context("import \"./A.sol\";", 16), None);
         assert_eq!(import_path_context("uint x = 1;", 11), None);
+    }
+
+    #[test]
+    fn remapping_prefix_item_replaces_the_whole_fragment() {
+        use tower_lsp::lsp_types::Position;
+        // `@op` typed, cursor after it; the edit must span the fragment so
+        // accepting `@openzeppelin/` doesn't append after the `@`.
+        let edit = Range::new(Position::new(0, 8), Position::new(0, 11));
+        let remaps = vec![("@openzeppelin/".to_string(), PathBuf::from("/nope"))];
+        let items = import_completions(Path::new("/nope"), "@op", &remaps, edit);
+        let it = items.iter().find(|i| i.label == "@openzeppelin/").expect("remapping offered");
+        match &it.text_edit {
+            Some(CompletionTextEdit::Edit(e)) => {
+                assert_eq!(e.range, edit);
+                assert_eq!(e.new_text, "@openzeppelin/");
+            }
+            other => panic!("expected an edit, got {other:?}"),
+        }
+        // And re-triggers so the remapped directory opens on accept.
+        assert!(it.command.is_some());
     }
 
     #[test]

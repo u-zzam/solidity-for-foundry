@@ -683,14 +683,19 @@ pub fn lib_dirs(root: &Path) -> Vec<PathBuf> {
     parse_config(root).libs.iter().map(|l| root.join(l)).collect()
 }
 
-/// The remapping prefixes configured for a project (e.g. `@openzeppelin/`),
-/// sorted and deduped, for import-path completion.
-pub fn remapping_prefixes(root: &Path) -> Vec<String> {
+/// The remappings configured for a project as `(name, target dir)` pairs — e.g.
+/// `("@openzeppelin/", "/abs/lib/openzeppelin-contracts/")` — for import-path
+/// completion. The name is what the user types; the target is the directory to
+/// list once they've entered it (`Remapping::path` is already absolute). Sorted
+/// by name and deduped. Uses the memoized config so keystroke-time completion
+/// doesn't re-walk lib/.
+pub fn remapping_targets(root: &Path) -> Vec<(String, PathBuf)> {
     let (_, remappings) = config_and_remappings(root);
-    let mut names: Vec<String> = remappings.into_iter().map(|r| r.name).collect();
-    names.sort();
-    names.dedup();
-    names
+    let mut out: Vec<(String, PathBuf)> =
+        remappings.into_iter().map(|r| (r.name, PathBuf::from(r.path))).collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out.dedup_by(|a, b| a.0 == b.0);
+    out
 }
 
 /// A cheap change signature for a project's source tree: every `.sol` file under
