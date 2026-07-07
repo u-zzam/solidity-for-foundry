@@ -753,11 +753,23 @@ impl LanguageServer for Backend {
         &self,
         params: DocumentHighlightParams,
     ) -> Result<Option<Vec<DocumentHighlight>>> {
-        // Always live: highlight every occurrence of the name under the cursor in
-        // the current buffer, straight from the tree-sitter parse.
         let p = params.text_document_position_params;
+        let uri = p.text_document.uri;
+        // Accurate solc index (resolves the symbol, not just the name) when it
+        // matches the buffer; else the live tree-sitter parse.
+        if let Some(root) = self.valid_index_root(&uri).await {
+            if let Ok(path) = uri.to_file_path() {
+                let guard = self.state.index.read().await;
+                if let Some(idx) = guard.get(&root) {
+                    let hl = idx.highlights(&path, p.position);
+                    if !hl.is_empty() {
+                        return Ok(Some(hl));
+                    }
+                }
+            }
+        }
         let parsed = self.state.parsed.read().await;
-        let Some(file) = parsed.get(&p.text_document.uri) else {
+        let Some(file) = parsed.get(&uri) else {
             return Ok(None);
         };
         let hl = parse::highlights(file, p.position);

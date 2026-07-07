@@ -13,10 +13,10 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 use tower_lsp::lsp_types::{
-    CompletionItem, CompletionItemKind, Documentation, DocumentSymbol, InlayHint, InlayHintKind,
-    InlayHintLabel, Location, ParameterInformation, ParameterLabel, Position, Range, SemanticToken,
-    SemanticTokenType, SignatureHelp, SignatureInformation, SymbolInformation, SymbolKind, TextEdit,
-    Url, WorkspaceEdit,
+    CompletionItem, CompletionItemKind, Documentation, DocumentHighlight, DocumentHighlightKind,
+    DocumentSymbol, InlayHint, InlayHintKind, InlayHintLabel, Location, ParameterInformation,
+    ParameterLabel, Position, Range, SemanticToken, SemanticTokenType, SignatureHelp,
+    SignatureInformation, SymbolInformation, SymbolKind, TextEdit, Url, WorkspaceEdit,
 };
 
 use crate::diagnostics::PositionMapper;
@@ -534,6 +534,38 @@ impl Index {
             }
         }
         Some(out)
+    }
+
+    /// Same-file highlights of the symbol under the cursor: every reference in
+    /// this file, plus its declaration (marked WRITE) when declared here. Returns
+    /// an empty vec when the cursor doesn't resolve to a known declaration.
+    pub fn highlights(&self, path: &Path, pos: Position) -> Vec<DocumentHighlight> {
+        let Some(slot) = self.slot_for(path) else {
+            return Vec::new();
+        };
+        let Some(id) = self.resolve(path, pos) else {
+            return Vec::new();
+        };
+        let Some(f) = self.files.get(&slot) else {
+            return Vec::new();
+        };
+        let m = PositionMapper::with_line_starts(&f.text, &f.line_starts);
+        let mut out = Vec::new();
+        if let Some(refs) = self.refs_by_decl.get(&id) {
+            for r in refs.iter().filter(|r| r.src_index == slot) {
+                out.push(DocumentHighlight {
+                    range: Range::new(m.position(r.start), m.position(r.end)),
+                    kind: Some(DocumentHighlightKind::READ),
+                });
+            }
+        }
+        if let Some(d) = self.decls.get(&id).filter(|d| d.src_index == slot) {
+            out.push(DocumentHighlight {
+                range: Range::new(m.position(d.name_start), m.position(d.name_end)),
+                kind: Some(DocumentHighlightKind::WRITE),
+            });
+        }
+        out
     }
 
     /// Markdown hover: a signature code block plus any NatSpec.
@@ -1422,6 +1454,42 @@ mod tests {
             apply(text, edits_for(&edit, &uri)),
             "library L{struct T{}}\ncontract C{L.T a;}"
         );
+    }
+
+    #[test]
+    fn highlights_mark_refs_read_and_declaration_write() {
+        // `struct Foo{}` used twice: highlighting resolves the symbol (not the
+        // name), so both uses show READ and the declaration shows WRITE.
+        let text = "struct Foo{}\ncontract C{Foo a;Foo b;}";
+        let use_span = |s: &str, id: i64| {
+            json!({ "id": id, "nodeType": "UserDefinedTypeName", "src": s,
+                    "referencedDeclaration": 10,
+                    "pathNode": { "id": id + 1, "nodeType": "IdentifierPath", "name": "Foo",
+                                  "src": s, "nameLocations": [s], "referencedDeclaration": 10 } })
+        };
+        let ast = json!({
+            "id": 1, "nodeType": "SourceUnit", "src": "0:37:0", "nodes": [
+                { "id": 10, "nodeType": "StructDefinition", "name": "Foo",
+                  "nameLocation": "7:3:0", "src": "0:12:0", "members": [] },
+                { "id": 20, "nodeType": "ContractDefinition", "name": "C",
+                  "nameLocation": "22:1:0", "src": "13:24:0", "nodes": [
+                    { "id": 30, "nodeType": "VariableDeclaration", "name": "a",
+                      "nameLocation": "28:1:0", "src": "24:5:0", "typeName": use_span("24:3:0", 31) },
+                    { "id": 40, "nodeType": "VariableDeclaration", "name": "b",
+                      "nameLocation": "34:1:0", "src": "30:5:0", "typeName": use_span("30:3:0", 41) }
+                ] }
+            ]
+        });
+        let path = "/no-such-dir-solidity-lsp/A.sol";
+        let idx = Index::build(&[src(1, path, text, ast)]);
+        // Cursor on the declaration name resolves to Foo.
+        let hl = idx.highlights(Path::new(path), Position::new(0, 7));
+        assert_eq!(hl.len(), 3, "{hl:?}");
+        let writes = hl.iter().filter(|h| h.kind == Some(DocumentHighlightKind::WRITE)).count();
+        let reads = hl.iter().filter(|h| h.kind == Some(DocumentHighlightKind::READ)).count();
+        assert_eq!((writes, reads), (1, 2), "{hl:?}");
+        // Not on a symbol -> nothing.
+        assert!(idx.highlights(Path::new(path), Position::new(0, 0)).is_empty());
     }
 
     #[test]
