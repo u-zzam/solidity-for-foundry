@@ -231,10 +231,18 @@ impl Backend {
         // files with unsaved edits, whose squiggles are owned by the live buffer
         // check (this on-disk compile would otherwise wipe them until the next
         // keystroke).
+        let mut orphaned: Vec<Url> = Vec::new();
         for uri in published.iter() {
             if next.contains(uri) {
                 continue;
             }
+            let path = uri.to_file_path().ok();
+            let dirty = self.is_dirty(uri).await;
+            // A file that vanished from disk (deleted, renamed, or branch-switched
+            // away) with no open buffer can never be recompiled, so the gate below
+            // would preserve its now-orphaned diagnostics forever. Clear it and
+            // forget it (and its stale quick-fixes).
+            let missing = !dirty && path.as_deref().is_some_and(|p| !p.exists());
             // Only clear a file this compile actually re-checked. A warm-cache
             // hit isn't in `compiled`, so its still-valid warnings survive
             // (foundry's cache doesn't persist diagnostics, so a cache-hit file
@@ -242,16 +250,28 @@ impl Backend {
             // are likewise left intact. A genuine fix always recompiles the
             // edited file, so real fixes still clear.
             let recompiled =
-                uri.to_file_path().is_ok_and(|p| compiled_ids.contains(&project::path_identity(&p)));
-            if !recompiled || self.is_dirty(uri).await {
+                path.as_deref().is_some_and(|p| compiled_ids.contains(&project::path_identity(p)));
+            if !missing && (!recompiled || dirty) {
                 next.insert(uri.clone());
                 continue;
+            }
+            if missing {
+                orphaned.push(uri.clone());
             }
             self.client
                 .publish_diagnostics(uri.clone(), Vec::new(), None)
                 .await;
         }
         *published = next;
+        drop(published);
+        // Drop quick-fixes for files that no longer exist (done outside the
+        // published lock to avoid nesting it under the fixes lock).
+        if !orphaned.is_empty() {
+            let mut fixes = self.state.fixes.lock().await;
+            for uri in &orphaned {
+                fixes.remove(uri);
+            }
+        }
     }
 
     /// The Foundry root whose solc index should answer for `uri`: an index
