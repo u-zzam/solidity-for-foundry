@@ -336,6 +336,26 @@ impl Backend {
             if me.state.index_gen.lock().await.get(&root).copied() != Some(gen) {
                 return;
             }
+            // A build for this root may already be running (large projects take
+            // tens of seconds). `build_index` single-flights and would silently
+            // drop us, losing this save. Wait for the in-flight build to finish,
+            // then index the now-current sources — unless a newer save arrives
+            // meanwhile, in which case that one takes over.
+            loop {
+                let busy = me
+                    .state
+                    .indexing
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains(&root);
+                if !busy {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                if me.state.index_gen.lock().await.get(&root).copied() != Some(gen) {
+                    return;
+                }
+            }
             me.build_index(uri).await;
         });
     }
