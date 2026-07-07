@@ -173,6 +173,10 @@ impl Index {
         let mut top_level: HashSet<i64> = HashSet::new();
         let mut impls: HashMap<i64, Vec<i64>> = HashMap::new();
         let mut bases: HashMap<i64, Vec<i64>> = HashMap::new();
+        // Contract declaration id -> its constructor's parameter names, so a
+        // `new C(...)` call (whose `NewExpression` references the contract, not a
+        // callable) can still label its arguments.
+        let mut constructors: HashMap<i64, Vec<String>> = HashMap::new();
 
         // Each `ImportDirective.sourceUnit` is the imported file's SourceUnit node
         // id; map every source unit's root id to its slot so an import resolves to
@@ -327,6 +331,7 @@ impl Index {
             });
 
             collect_containers(&s.ast, &mut containers);
+            collect_constructors(&s.ast, &mut constructors);
             files.insert(
                 s.index,
                 FileEntry {
@@ -356,15 +361,20 @@ impl Index {
         // Resolve queued call-site hints now that every declaration is known
         // (a call's callee may be declared in any indexed file).
         for h in pending {
-            let Some(decl) = decls.get(&h.callee) else {
+            // A `new C(...)` call resolves to the contract id, so take its
+            // constructor's parameters; every other call resolves to the callee's
+            // own declaration.
+            let Some(param_names) =
+                constructors.get(&h.callee).or_else(|| decls.get(&h.callee).map(|d| &d.param_names))
+            else {
                 continue;
             };
             // `using for` calls inject the receiver as the first parameter, so
             // the parameter list is one longer than the written arguments; the
             // offset realigns argument N with its real parameter.
-            let offset = decl.param_names.len().saturating_sub(h.arg_count);
+            let offset = param_names.len().saturating_sub(h.arg_count);
             let Some(label) =
-                param_hint(&decl.param_names, h.arg_index + offset, h.arg_ident.as_deref())
+                param_hint(param_names, h.arg_index + offset, h.arg_ident.as_deref())
             else {
                 continue;
             };
@@ -917,11 +927,17 @@ fn collect_call_hints(map: &Map<String, Value>, src_index: usize, out: &mut Vec<
     if map.get("names").and_then(|n| n.as_array()).is_some_and(|a| !a.is_empty()) {
         return;
     }
-    let Some(callee) = map
-        .get("expression")
-        .and_then(|e| e.as_object())
+    let expr = map.get("expression").and_then(|e| e.as_object());
+    let Some(callee) = expr
         .and_then(|e| geti(e, "referencedDeclaration"))
         .filter(|id| *id >= 0)
+        // `new C(...)`: the expression is a `NewExpression` with no
+        // `referencedDeclaration`; its `typeName` references the contract, whose
+        // constructor's parameter names the resolver looks up.
+        .or_else(|| {
+            let e = expr?;
+            (gets(e, "nodeType") == Some("NewExpression")).then(|| type_ref(e)).flatten()
+        })
     else {
         return;
     };
@@ -1078,6 +1094,39 @@ fn collect_containers(ast: &Value, containers: &mut HashMap<String, Vec<Member>>
             .map(|arr| arr.iter().filter_map(member_of).collect())
             .unwrap_or_default();
         containers.entry(name.to_string()).or_default().extend(members);
+    }
+}
+
+/// Record each contract's constructor parameter names, keyed by the contract's
+/// declaration id, so a `new C(...)` call — which references the contract, not a
+/// callable — can label its arguments.
+fn collect_constructors(ast: &Value, out: &mut HashMap<i64, Vec<String>>) {
+    let Some(nodes) = ast.get("nodes").and_then(|n| n.as_array()) else {
+        return;
+    };
+    for node in nodes {
+        let Some(map) = node.as_object() else {
+            continue;
+        };
+        if gets(map, "nodeType") != Some("ContractDefinition") {
+            continue;
+        }
+        let Some(cid) = geti(map, "id") else {
+            continue;
+        };
+        let Some(members) = map.get("nodes").and_then(|n| n.as_array()) else {
+            continue;
+        };
+        for m in members {
+            let Some(mm) = m.as_object() else {
+                continue;
+            };
+            if gets(mm, "nodeType") == Some("FunctionDefinition")
+                && gets(mm, "kind") == Some("constructor")
+            {
+                out.insert(cid, decl_param_names(mm));
+            }
+        }
     }
 }
 
@@ -1453,6 +1502,56 @@ mod tests {
         let edits = edits_for(&edit, &uri);
         assert_eq!(edits.len(), 2, "declaration + the `Foo` use, not the `F` alias");
         assert_eq!(apply(text, edits), "contract Bar{}\nBar x;\nF y;");
+    }
+
+    #[test]
+    fn new_expression_hints_use_constructor_params() {
+        // `new D(_, _)`: the FunctionCall's expression is a NewExpression that
+        // references contract D (not a callable), so the argument labels must come
+        // from D's constructor's parameter names.
+        let text = "contract D{}";
+        let ast = json!({
+            "id": 1, "nodeType": "SourceUnit", "src": "0:12:0",
+            "nodes": [
+                { "id": 10, "nodeType": "ContractDefinition", "name": "D",
+                  "nameLocation": "9:1:0", "src": "0:12:0", "nodes": [
+                    { "id": 11, "nodeType": "FunctionDefinition", "name": "", "kind": "constructor",
+                      "src": "0:1:0", "parameters": { "parameters": [
+                        { "id": 12, "name": "amount", "nodeType": "VariableDeclaration", "src": "0:1:0" },
+                        { "id": 13, "name": "to", "nodeType": "VariableDeclaration", "src": "0:1:0" }
+                      ] } }
+                  ] },
+                { "id": 20, "nodeType": "ContractDefinition", "name": "C",
+                  "nameLocation": "0:1:0", "src": "0:12:0", "nodes": [
+                    { "id": 21, "nodeType": "FunctionDefinition", "name": "f", "kind": "function",
+                      "nameLocation": "0:1:0", "src": "0:12:0",
+                      "body": { "nodeType": "Block", "src": "0:12:0", "statements": [
+                        { "nodeType": "ExpressionStatement", "src": "0:12:0", "expression": {
+                          "nodeType": "FunctionCall", "kind": "functionCall", "src": "0:12:0",
+                          "expression": { "nodeType": "NewExpression", "src": "0:3:0",
+                            "typeName": { "nodeType": "UserDefinedTypeName", "src": "4:1:0",
+                              "referencedDeclaration": 10 } },
+                          "arguments": [
+                            { "nodeType": "Literal", "src": "0:1:0" },
+                            { "nodeType": "Literal", "src": "1:1:0" }
+                          ] } }
+                      ] } }
+                  ] }
+            ]
+        });
+        let path = "/no-such-dir-solidity-lsp/A.sol";
+        let idx = Index::build(&[src(1, path, text, ast)]);
+        let full = Range::new(Position::new(0, 0), Position::new(0, 12));
+        let labels: Vec<String> = idx
+            .inlay_hints(Path::new(path), full)
+            .into_iter()
+            .filter_map(|h| match h.label {
+                InlayHintLabel::String(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert!(labels.contains(&"amount:".to_string()), "{labels:?}");
+        assert!(labels.contains(&"to:".to_string()), "{labels:?}");
     }
 
     #[test]

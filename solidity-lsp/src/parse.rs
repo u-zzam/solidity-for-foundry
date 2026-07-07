@@ -294,6 +294,22 @@ fn walk<'a>(
 
 /// If `node` is a named declaration, return `(name, kind, name_start, name_end)`.
 fn def_of(node: Node, src: &[u8]) -> Option<(String, DefKind, usize, usize)> {
+    // Constructor / receive / fallback carry no name identifier; synthesize one at
+    // the leading keyword so they show in the outline and (for a constructor) can
+    // lend their parameter names to `new C(...)` inlay hints.
+    let synthetic = match node.kind() {
+        "constructor_definition" => Some("constructor"),
+        "fallback_receive_definition" => {
+            let receive =
+                node.utf8_text(src).map(|t| t.trim_start().starts_with("receive")).unwrap_or(false);
+            Some(if receive { "receive" } else { "fallback" })
+        }
+        _ => None,
+    };
+    if let Some(name) = synthetic {
+        let s = node.start_byte();
+        return Some((name.to_string(), DefKind::Function, s, s + name.len()));
+    }
     let kind = match node.kind() {
         "contract_declaration" => DefKind::Contract,
         "interface_declaration" => DefKind::Interface,
@@ -347,7 +363,7 @@ fn header(node: Node, src: &[u8]) -> String {
 /// each positional argument. An unnamed parameter yields an empty string.
 fn param_names(node: Node, src: &[u8]) -> Vec<String> {
     let child_kind = match node.kind() {
-        "function_definition" | "modifier_definition" => "parameter",
+        "function_definition" | "modifier_definition" | "constructor_definition" => "parameter",
         "event_definition" => "event_parameter",
         "error_declaration" => "error_parameter",
         "struct_declaration" => "struct_member",
@@ -448,6 +464,11 @@ fn callee_name(node: Node, src: &[u8]) -> Option<String> {
             .child_by_field_name("property")
             .and_then(|p| p.utf8_text(src).ok())
             .map(String::from),
+        // `new C(...)`: the constructed type's name, so the call resolves to `C`'s
+        // constructor. (`new Lib.T(...)` is a `member_expression` handled above.)
+        "new_expression" => node
+            .child_by_field_name("name")
+            .and_then(|t| last_identifier(t.named_child(0)?, src)),
         _ => None,
     }
 }
@@ -808,6 +829,13 @@ pub fn call_hints(files: &HashMap<Url, File>, uri: &Url, range: Range) -> Vec<In
             if d.kind.takes_args() {
                 by_name.entry(d.name.as_str()).or_default().push(&d.params);
             }
+            // A `new C(...)` call names the contract, not "constructor", so also
+            // index a constructor's parameters under its enclosing contract name.
+            if d.name == "constructor" {
+                if let Some(name) = d.container.map(|i| f.defs[i].name.as_str()) {
+                    by_name.entry(name).or_default().push(&d.params);
+                }
+            }
         }
     }
 
@@ -1125,6 +1153,47 @@ contract Token is Base {
         };
         assert_eq!(detail("balanceOf"), "mapping(address => uint256) public balanceOf");
         assert_eq!(detail("count"), "uint256 public count");
+    }
+
+    #[test]
+    fn constructor_receive_outline_and_new_call_hints() {
+        const SRC: &str = r#"
+contract Token {
+    constructor(uint256 supply, address owner) {}
+    receive() external payable {}
+    fallback() external {}
+}
+contract Factory {
+    function make() public {
+        Token t = new Token(100, msg.sender);
+    }
+}
+"#;
+        let uri = Url::parse("file:///F.sol").unwrap();
+        let mut files = HashMap::new();
+        files.insert(uri.clone(), parse(SRC));
+
+        // The constructor, receive and fallback appear in Token's outline.
+        let syms = document_symbols(files.get(&uri).unwrap());
+        let token = syms.iter().find(|s| s.name == "Token").unwrap();
+        let members: Vec<&str> =
+            token.children.as_ref().unwrap().iter().map(|c| c.name.as_str()).collect();
+        for m in ["constructor", "receive", "fallback"] {
+            assert!(members.contains(&m), "outline missing {m}: {members:?}");
+        }
+
+        // `new Token(100, msg.sender)` labels the constructor's parameters.
+        let m = PositionMapper::new(SRC);
+        let full = Range::new(m.position(0), m.position(SRC.len()));
+        let labels: Vec<String> = call_hints(&files, &uri, full)
+            .iter()
+            .filter_map(|h| match &h.label {
+                InlayHintLabel::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(labels.contains(&"supply:".to_string()), "{labels:?}");
+        assert!(labels.contains(&"owner:".to_string()), "{labels:?}");
     }
 
     #[test]
