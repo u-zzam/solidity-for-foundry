@@ -210,7 +210,13 @@ async function ensureServer(
         !name.includes(".part") &&
         name !== current
       ) {
-        fs.rmSync(path.join(dir, name), { force: true });
+        try {
+          fs.rmSync(path.join(dir, name), { force: true });
+        } catch {
+          // Best-effort: a still-running old server locks its exe on Windows
+          // (EPERM), which force:true doesn't suppress. Leaving one stale
+          // binary must never abort an already-verified download.
+        }
       }
     }
     return dest;
