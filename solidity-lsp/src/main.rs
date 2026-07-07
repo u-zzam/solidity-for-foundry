@@ -407,6 +407,16 @@ impl Backend {
             return;
         };
 
+        // A newer edit landed while solc ran — these checks aren't mutually
+        // exclusive and a large import graph takes seconds, far longer than the
+        // 300ms debounce. Its own check will publish; discarding this stale
+        // result keeps a slow older check from repainting just-fixed squiggles at
+        // pre-edit offsets. Covers every trigger path, including the version-less
+        // `schedule_live_check_now`.
+        if self.state.docs.read().await.get(&uri) != Some(&buffer) {
+            return;
+        }
+
         // Map positions against the buffer solc actually compiled, not disk. With
         // no project root, errors carry the file's own absolute path, so any base
         // works for the URI match; use the file's parent.
