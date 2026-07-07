@@ -212,6 +212,7 @@ pub fn locate_root(start: &Path) -> Option<PathBuf> {
 }
 
 /// The subset of `foundry.toml [profile.default]` that affects diagnostics.
+#[derive(Clone)]
 struct Config {
     solc: Option<Version>,
     src: PathBuf,
@@ -422,14 +423,75 @@ fn resolve_remappings(root: &Path, cfg: &Config) -> Vec<Remapping> {
     map.into_values().collect()
 }
 
-fn build_paths(root: &Path, cfg: &Config) -> Result<ProjectPathsConfig<SolcLanguage>, String> {
+/// The parsed config and resolved remappings for `root`, memoized so the hot
+/// live-check and import-completion paths don't repeat the work on every
+/// 300ms-debounced keystroke: `resolve_remappings` walks every lib/ dir
+/// recursively (`Remapping::find_many`) and re-reads foundry.toml. The cache is
+/// keyed on the bytes of foundry.toml + remappings.txt (plus `FOUNDRY_PROFILE`),
+/// so an in-editor config edit is picked up immediately; `invalidate_root` drops
+/// the entry for external changes (forge install, branch switch) the file
+/// watcher reports, which can add libs without touching those two files.
+struct CachedConfig {
+    key: u64,
+    config: Config,
+    remappings: Vec<Remapping>,
+}
+
+fn config_cache() -> &'static std::sync::Mutex<HashMap<PathBuf, CachedConfig>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, CachedConfig>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn config_and_remappings(root: &Path) -> (Config, Vec<Remapping>) {
+    let profile = std::env::var("FOUNDRY_PROFILE").unwrap_or_default();
+    let key = config_key(root, &profile);
+    if let Some(c) = config_cache().lock().unwrap_or_else(|e| e.into_inner()).get(root) {
+        if c.key == key {
+            return (c.config.clone(), c.remappings.clone());
+        }
+    }
+    let config = config_for(root, &profile);
+    let remappings = resolve_remappings(root, &config);
+    config_cache().lock().unwrap_or_else(|e| e.into_inner()).insert(
+        root.to_path_buf(),
+        CachedConfig { key, config: config.clone(), remappings: remappings.clone() },
+    );
+    (config, remappings)
+}
+
+/// Drop the memoized config for `root` so the next `config_and_remappings`
+/// recomputes it. Called when the file watcher reports an external change (a
+/// `forge install` or branch switch) that can alter remappings by adding or
+/// removing lib/ sources without editing foundry.toml or remappings.txt.
+pub fn invalidate_root(root: &Path) {
+    config_cache().lock().unwrap_or_else(|e| e.into_inner()).remove(root);
+}
+
+/// A content signature for the config files a memoized `config_and_remappings`
+/// depends on. Hashing the bytes (rather than mtimes) sidesteps coarse mtime
+/// resolution, so two edits within the same tick still invalidate.
+fn config_key(root: &Path, profile: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    profile.hash(&mut h);
+    std::fs::read(root.join("foundry.toml")).unwrap_or_default().hash(&mut h);
+    std::fs::read(root.join("remappings.txt")).unwrap_or_default().hash(&mut h);
+    h.finish()
+}
+
+fn build_paths(
+    root: &Path,
+    cfg: &Config,
+    remappings: Vec<Remapping>,
+) -> Result<ProjectPathsConfig<SolcLanguage>, String> {
     ProjectPathsConfig::builder()
         .root(root)
         .sources(root.join(&cfg.src))
         .tests(root.join(&cfg.tests))
         .scripts(root.join(&cfg.scripts))
         .libs(cfg.libs.iter().map(|l| root.join(l)))
-        .remappings(resolve_remappings(root, cfg))
+        .remappings(remappings)
         .build()
         .map_err(|e| e.to_string())
 }
@@ -499,8 +561,8 @@ fn filter_errors(mut errors: Vec<SolcError>, root: &Path, cfg: &Config) -> Vec<S
 /// source indices must be consistent across all files (they are assigned per
 /// compilation). Diagnostics use the fast cached path (`full = false`).
 pub fn compile(root: &Path, full: bool) -> Result<CompileOutput, String> {
-    let cfg = parse_config(root);
-    let mut paths = build_paths(root, &cfg)?;
+    let (cfg, remappings) = config_and_remappings(root);
+    let mut paths = build_paths(root, &cfg, remappings)?;
 
     // Isolate our build cache/artifacts from the user's `out/` so we never race
     // `forge build`; `cache/` is gitignored by every Foundry project. The index
@@ -563,7 +625,7 @@ pub fn check_buffer(
     buffer: &str,
     open: &HashMap<PathBuf, String>,
 ) -> Result<Vec<SolcError>, String> {
-    let cfg = parse_config(root);
+    let (cfg, remappings) = config_and_remappings(root);
     // A project that pins no solc (e.g. version comes from each file's pragma)
     // otherwise got no live diagnostics at all; fall back to the buffer's pragma.
     let version = cfg
@@ -578,7 +640,7 @@ pub fn check_buffer(
     solc.base_path = Some(root.to_path_buf());
 
     let project = ProjectBuilder::<SolcCompiler>::default()
-        .paths(build_paths(root, &cfg)?)
+        .paths(build_paths(root, &cfg, remappings)?)
         .settings(SolcSettings { settings: build_settings(&cfg), cli_settings: Default::default() })
         .build(SolcCompiler::Specific(solc.clone()))
         .map_err(|e| e.to_string())?;
@@ -624,9 +686,8 @@ pub fn lib_dirs(root: &Path) -> Vec<PathBuf> {
 /// The remapping prefixes configured for a project (e.g. `@openzeppelin/`),
 /// sorted and deduped, for import-path completion.
 pub fn remapping_prefixes(root: &Path) -> Vec<String> {
-    let cfg = parse_config(root);
-    let mut names: Vec<String> =
-        resolve_remappings(root, &cfg).into_iter().map(|r| r.name).collect();
+    let (_, remappings) = config_and_remappings(root);
+    let mut names: Vec<String> = remappings.into_iter().map(|r| r.name).collect();
     names.sort();
     names.dedup();
     names
@@ -881,6 +942,30 @@ mod tests {
         let cov = config_for(&root, "coverage");
         assert_eq!(cov.via_ir, Some(true));
         assert_eq!(cov.solc, Some(Version::new(0, 8, 19)));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn config_memo_tracks_content_and_invalidation() {
+        let root = temp_dir();
+        std::fs::write(root.join("foundry.toml"), "[profile.default]\n").unwrap();
+        std::fs::write(root.join("remappings.txt"), "@a/=lib/a/\n").unwrap();
+
+        let names = |root: &Path| {
+            let (_, r) = config_and_remappings(root);
+            r.into_iter().map(|r| r.name).collect::<Vec<_>>()
+        };
+        assert!(names(&root).contains(&"@a/".to_string()));
+
+        // Changing remappings.txt content changes the key, so the memo recomputes
+        // rather than serving the stale set.
+        std::fs::write(root.join("remappings.txt"), "@a/=lib/a/\n@b/=lib/b/\n").unwrap();
+        assert!(names(&root).contains(&"@b/".to_string()));
+
+        // invalidate_root drops the entry, forcing a fresh resolve on next call.
+        invalidate_root(&root);
+        assert!(names(&root).contains(&"@b/".to_string()));
+
         std::fs::remove_dir_all(&root).ok();
     }
 

@@ -832,17 +832,23 @@ impl LanguageServer for Backend {
         let offset = diagnostics::PositionMapper::new(&text).offset(p.position);
 
         // Import path: sibling files/dirs relative to this file, plus the
-        // project's remapping prefixes. No index or parse needed.
+        // project's remapping prefixes. No index or parse needed, but resolving
+        // remappings walks lib/ and reading the directory hits disk, so run it
+        // off the dispatch task like every other heavy path.
         if let Some(prefix) = complete::import_path_context(&text, offset) {
-            let path = uri.to_file_path().ok();
-            let dir = path.as_deref().and_then(Path::parent).map(Path::to_path_buf);
-            let remaps = path
-                .as_deref()
-                .and_then(project::locate_root)
-                .map(|r| project::remapping_prefixes(&r))
-                .unwrap_or_default();
-            let items =
-                dir.map(|d| complete::import_completions(&d, &prefix, &remaps)).unwrap_or_default();
+            let uri = uri.clone();
+            let items = tokio::task::spawn_blocking(move || {
+                let path = uri.to_file_path().ok();
+                let dir = path.as_deref().and_then(Path::parent).map(Path::to_path_buf);
+                let remaps = path
+                    .as_deref()
+                    .and_then(project::locate_root)
+                    .map(|r| project::remapping_prefixes(&r))
+                    .unwrap_or_default();
+                dir.map(|d| complete::import_completions(&d, &prefix, &remaps)).unwrap_or_default()
+            })
+            .await
+            .unwrap_or_default();
             return Ok((!items.is_empty()).then_some(CompletionResponse::Array(items)));
         }
 
@@ -1209,6 +1215,13 @@ impl LanguageServer for Backend {
         }
         if roots.is_empty() {
             return;
+        }
+        // Drop each affected root's memoized config + remappings: a forge install
+        // or branch switch can add or remove lib/ sources (changing remappings)
+        // without editing foundry.toml or remappings.txt, so the content-keyed
+        // memo wouldn't otherwise notice.
+        for root in &roots {
+            project::invalidate_root(root);
         }
         // One compile + index per affected root, keyed off any open buffer in it.
         // The warm incremental compile republishes and clears diagnostics across
