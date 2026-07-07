@@ -2,7 +2,7 @@
   "name": "solidity-for-foundry",
   "displayName": "Solidity for Foundry",
   "description": "The Solidity language server for the modern, Foundry-native stack: diagnostics, formatting, and navigation on your project's exact solc version.",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "license": "MIT",
   "publisher": "u-zzam",
   "repository": { "type": "git", "url": "https://github.com/u-zzam/solidity-for-foundry" },

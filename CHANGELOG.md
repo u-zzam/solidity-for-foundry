@@ -10,6 +10,8 @@ breaking change.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-07
+
 ### Added
 
 - Run-test code lens on Foundry test and invariant functions, running
