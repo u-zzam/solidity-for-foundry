@@ -1052,6 +1052,12 @@ impl LanguageServer for Backend {
         let was_dirty = self.is_dirty(&uri).await;
         self.state.docs.write().await.remove(&uri);
         self.state.parsed.write().await.remove(&uri);
+        // Drop the version entry: it would otherwise grow unbounded (one per
+        // edited file), and a did_change parse task still in flight would pass
+        // its version guard and reinsert the closed doc into `parsed`, leaving a
+        // ghost the parser-based features keep answering from. Removing it makes
+        // that guard fail (None != Some(version)).
+        self.state.live_versions.lock().await.remove(&uri);
         if was_dirty {
             // Clear the stale diagnostics, then restore the on-disk truth: a
             // Foundry file gets a fresh compile (which republishes any real
