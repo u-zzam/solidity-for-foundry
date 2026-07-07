@@ -10,6 +10,69 @@ breaking change.
 
 ## [Unreleased]
 
+### Added
+
+- Run-test code lens on Foundry test and invariant functions, running
+  `forge test` for the one you click.
+- Quick-fixes for common solc errors: add a visibility or data-location
+  keyword, `override`/`virtual`, `abstract`, a checksummed address, or a
+  `view`/`pure` mutability.
+- Project-wide navigation backed by a background parse, so go-to-definition,
+  references, and symbols work before the first successful compile and while
+  the build is broken.
+- Signature help, inlay hints, and document highlight fall back to the live
+  parser, so they keep working during cold start, mid-edit, and without a
+  `foundry.toml`.
+- Completion adds sized integer/bytes types, unit and boolean literals, member
+  builtins for elementary and array receivers, and NatSpec documentation;
+  import completion suggests remapping prefixes and triggers on `/`, `"`, `'`.
+- As-you-type diagnostics fall back to the buffer's `pragma` version when the
+  project pins no solc, and resolve relative imports for config-less files.
+- Hover shows inherited NatSpec for functions documented only with
+  `@inheritdoc`.
+- `FOUNDRY_PROFILE` selects the active `foundry.toml` profile, and files
+  matched by `skip` are excluded from diagnostics to match `forge build`.
+- The Zed extension ships an outline (breadcrumbs and outline panel) plus
+  richer comment and word-character configuration.
+- Release binaries publish SHA-256 checksums, which the VS Code client
+  verifies after download.
+
+### Changed
+
+- A release is published only after every platform binary builds (drafted
+  until complete), so a partial build can't strand users on a version missing
+  their binary.
+- Release binaries are stripped, shrinking the download.
+- Diagnostics compiles are debounced and coalesced per project root, and live
+  type-checks are bounded, so a burst of edits or an external change can't
+  spawn unbounded compiles.
+- Resolved config and remappings are memoized per root, and the navigation
+  index skips rebuilding when the sources haven't changed.
+
+### Fixed
+
+- Opening a file that nests a type inside a same-named container no longer
+  crashes the server.
+- Rename no longer produces duplicate edits, corrupts a qualified path, or
+  stops at a function's override family; it leaves import aliases intact and
+  refuses to edit library-dependency sources.
+- Compiling one project no longer clears another root's or a standalone file's
+  diagnostics and quick-fixes.
+- Warnings on files served from the compile cache survive an incremental
+  compile.
+- Closing a tab with unsaved edits clears its now-stale diagnostics, and
+  deleted or renamed sources have theirs cleared too.
+- As-you-type diagnostics work on Windows, where drive-letter paths are cased
+  and percent-encoded differently.
+- Hovering a `mapping` state variable no longer truncates the type at `=>`.
+- A slow, superseded live check no longer republishes over newer diagnostics
+  or revives a fixed error.
+- The Zed client downloads the server matching the extension's version,
+  prefers a cached binary so it starts offline, and supports arm64 Linux.
+- The VS Code client's server download handles a premature connection close,
+  a corrupt cached binary, and two windows activating at once, and recovers a
+  failed start on Restart.
+
 ## [0.3.0] - 2026-06-29
 
 ### Added
