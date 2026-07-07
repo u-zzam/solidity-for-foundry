@@ -259,6 +259,7 @@ impl Index {
                     if refid >= 0 {
                         let loc = gets(map, "memberLocation")
                             .and_then(parse_src)
+                            .or_else(|| last_name_location(map))
                             .or_else(|| gets(map, "src").and_then(parse_src));
                         if let Some((start, len)) = loc {
                             if len > 0 {
@@ -1108,6 +1109,18 @@ fn quoted_span(text: &str, src: &str) -> Option<(usize, usize)> {
     Some((start + open, start + open + close + 2))
 }
 
+/// The final segment's location from an `IdentifierPath`'s `nameLocations` (solc
+/// ≥0.8.16): for a qualified path `Lib.Type` the whole `src` covers `Lib.Type`,
+/// but only the last segment (`Type`) is the reference to edit or navigate to.
+/// `None` when the field is absent (a plain identifier has none).
+fn last_name_location(map: &Map<String, Value>) -> Option<(usize, usize)> {
+    map.get("nameLocations")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.last())
+        .and_then(|v| v.as_str())
+        .and_then(parse_src)
+}
+
 /// Parse a solc `start:length:index` location, returning `(start, length)` when
 /// the length is present (>= 0).
 fn parse_src(s: &str) -> Option<(usize, usize)> {
@@ -1204,6 +1217,51 @@ mod tests {
         ranges.dedup();
         assert_eq!(ranges.len(), 2, "duplicate edit range");
         assert_eq!(apply(text, edits), "struct Bar{}\ncontract C{Bar a;}");
+    }
+
+    #[test]
+    fn qualified_path_renames_last_segment_only() {
+        // `L.S a;` — the IdentifierPath's src covers the whole `L.S`, but rename
+        // must touch only the `S` segment (from nameLocations), leaving `L.` intact.
+        let text = "library L{struct S{}}\ncontract C{L.S a;}";
+        let ast = json!({
+            "id": 1, "nodeType": "SourceUnit", "src": "0:40:0",
+            "nodes": [
+                { "id": 5, "nodeType": "ContractDefinition", "contractKind": "library",
+                  "name": "L", "nameLocation": "8:1:0", "src": "0:21:0", "nodes": [
+                    { "id": 15, "nodeType": "StructDefinition", "name": "S",
+                      "nameLocation": "17:1:0", "src": "10:10:0", "members": [] }
+                  ]
+                },
+                { "id": 20, "nodeType": "ContractDefinition", "name": "C",
+                  "nameLocation": "31:1:0", "src": "22:18:0", "nodes": [
+                    { "id": 30, "nodeType": "VariableDeclaration", "name": "a",
+                      "nameLocation": "37:1:0", "src": "33:6:0",
+                      "typeName": {
+                        "id": 31, "nodeType": "UserDefinedTypeName", "src": "33:3:0",
+                        "referencedDeclaration": 15,
+                        "pathNode": {
+                            "id": 32, "nodeType": "IdentifierPath", "name": "L.S",
+                            "src": "33:3:0", "nameLocations": ["33:1:0", "35:1:0"],
+                            "referencedDeclaration": 15
+                        }
+                      }
+                    }
+                  ]
+                }
+            ]
+        });
+        let path = "/no-such-dir-solidity-lsp/A.sol";
+        let idx = Index::build(&[src(1, path, text, ast)]);
+        let p = Path::new(path);
+        let s_pos = Position::new(1, 13); // on the `S` in `L.S`
+        assert_eq!(idx.references(p, s_pos, false).len(), 1);
+        let edit = idx.rename(p, s_pos, "T").unwrap();
+        let uri = Url::from_file_path(p).unwrap();
+        assert_eq!(
+            apply(text, edits_for(&edit, &uri)),
+            "library L{struct T{}}\ncontract C{L.T a;}"
+        );
     }
 
     #[test]
