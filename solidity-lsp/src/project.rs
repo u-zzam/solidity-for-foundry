@@ -551,7 +551,13 @@ pub fn compile(root: &Path, full: bool) -> Result<CompileOutput, String> {
 /// codegen (so via-ir projects stay fast). Requires a pinned solc version.
 pub fn check_buffer(root: &Path, target: &Path, buffer: &str) -> Result<Vec<SolcError>, String> {
     let cfg = parse_config(root);
-    let version = cfg.solc.clone().ok_or("project does not pin a solc version")?;
+    // A project that pins no solc (e.g. version comes from each file's pragma)
+    // otherwise got no live diagnostics at all; fall back to the buffer's pragma.
+    let version = cfg
+        .solc
+        .clone()
+        .or_else(|| detect_solc(buffer))
+        .ok_or("no solc version pinned or in the buffer's pragma")?;
     let solc = Solc::find_or_install(&version).map_err(|e| e.to_string())?;
 
     let project = ProjectBuilder::<SolcCompiler>::default()
