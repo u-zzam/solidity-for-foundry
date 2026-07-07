@@ -530,14 +530,32 @@ pub fn definition(files: &HashMap<Url, File>, uri: &Url, pos: Position) -> Vec<L
     let Some(name) = ident_at(file, offset).map(|i| i.name.clone()) else {
         return Vec::new();
     };
-    let same: Vec<Location> = file
-        .defs
-        .iter()
-        .filter(|d| d.name == name)
-        .map(|d| location(uri, &file.text, d.name_start, d.name_end))
-        .collect();
-    if !same.is_empty() {
-        return same;
+    // Rank same-file candidates by scope: the smallest declaration span that
+    // encloses both the cursor and the candidate. A candidate in the cursor's
+    // own function/block shares the tightest scope (innermost), one elsewhere in
+    // the same contract shares that contract, a file-level one shares nothing
+    // (usize::MAX). Return only the tightest tier so a same-named local in
+    // another function isn't offered.
+    let common_scope = |target: usize| {
+        file.defs
+            .iter()
+            .filter(|e| {
+                e.full_start <= offset
+                    && offset <= e.full_end
+                    && e.full_start <= target
+                    && target <= e.full_end
+            })
+            .map(|e| e.full_end - e.full_start)
+            .min()
+            .unwrap_or(usize::MAX)
+    };
+    let same: Vec<&Def> = file.defs.iter().filter(|d| d.name == name).collect();
+    if let Some(best) = same.iter().map(|d| common_scope(d.name_start)).min() {
+        return same
+            .iter()
+            .filter(|d| common_scope(d.name_start) == best)
+            .map(|d| location(uri, &file.text, d.name_start, d.name_end))
+            .collect();
     }
     files
         .iter()
@@ -901,6 +919,29 @@ contract Counter {
         assert_eq!(defs.len(), 1);
         let def_pos = pos_of(SRC, "add(uint a");
         assert_eq!(defs[0].range.start, def_pos);
+    }
+
+    #[test]
+    fn definition_prefers_innermost_scope() {
+        const SRC: &str = r#"
+contract C {
+    function f() public {
+        uint256 x = 1;
+        x = 2;
+    }
+    function g() public {
+        uint256 x = 3;
+    }
+}
+"#;
+        let uri = Url::parse("file:///C.sol").unwrap();
+        let mut files = HashMap::new();
+        files.insert(uri.clone(), parse(SRC));
+        // The `x` in `x = 2` resolves only to f's local, not g's same-named one.
+        let at = pos_of(SRC, "x = 2");
+        let defs = definition(&files, &uri, at);
+        assert_eq!(defs.len(), 1, "{defs:?}");
+        assert_eq!(defs[0].range.start, pos_of(SRC, "x = 1"));
     }
 
     #[test]
