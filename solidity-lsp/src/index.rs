@@ -254,16 +254,22 @@ impl Index {
                         ) {
                             callables.entry(name.to_string()).or_default().push(id);
                             collect_param_ids(map, &mut param_ids);
-                            // Record this function as an implementation of each
-                            // base it overrides (inverse of `baseFunctions`), and
-                            // the reverse edge, so rename can span the family.
-                            if let Some(base_fns) =
-                                map.get("baseFunctions").and_then(|b| b.as_array())
-                            {
-                                for base in base_fns.iter().filter_map(|b| b.as_i64()) {
-                                    impls.entry(base).or_default().push(id);
-                                    bases.entry(id).or_default().push(base);
-                                }
+                        }
+                        // Record this declaration as an implementation of each base
+                        // it overrides (inverse of `baseFunctions`/`baseModifiers`),
+                        // plus the reverse edge, so rename spans the whole family and
+                        // go-to-impl finds it. Functions, public-getter state
+                        // variables and events/errors carry `baseFunctions`; a
+                        // modifier's bases live under `baseModifiers`.
+                        let base_key = if kind == "ModifierDefinition" {
+                            "baseModifiers"
+                        } else {
+                            "baseFunctions"
+                        };
+                        if let Some(base_fns) = map.get(base_key).and_then(|b| b.as_array()) {
+                            for base in base_fns.iter().filter_map(|b| b.as_i64()) {
+                                impls.entry(base).or_default().push(id);
+                                bases.entry(id).or_default().push(base);
                             }
                         }
                         // A variable is a bare-name symbol only if it's a state
@@ -1677,6 +1683,58 @@ mod tests {
         let edits = edits_for(&edit, &uri);
         assert_eq!(edits.len(), 3, "base decl + override decl + call site");
         assert_eq!(apply(text, edits), "function bar(){}\nfunction bar(){}\nbar();");
+    }
+
+    #[test]
+    fn rename_spans_public_getter_override() {
+        // An interface function implemented by a public state-variable getter. The
+        // override edge lives on the VariableDeclaration (`baseFunctions`), so
+        // renaming the function must rename the getter too, or the getter stops
+        // overriding and the build breaks.
+        let text = "function val(){}\nuint public val;";
+        let ast = json!({
+            "id": 1, "nodeType": "SourceUnit", "src": "0:33:0",
+            "nodes": [
+                { "id": 10, "nodeType": "FunctionDefinition", "name": "val",
+                  "kind": "function", "nameLocation": "9:3:0", "src": "0:16:0" },
+                { "id": 20, "nodeType": "VariableDeclaration", "name": "val",
+                  "stateVariable": true, "nameLocation": "29:3:0", "src": "17:16:0",
+                  "baseFunctions": [10] }
+            ]
+        });
+        let path = "/no-such-dir-solidity-lsp/A.sol";
+        let idx = Index::build(&[src(1, path, text, ast)]);
+        let p = Path::new(path);
+        let edit = idx.rename(p, Position::new(0, 9), "amount").unwrap();
+        let uri = Url::from_file_path(p).unwrap();
+        let edits = edits_for(&edit, &uri);
+        assert_eq!(edits.len(), 2, "function decl + getter decl");
+        assert_eq!(apply(text, edits), "function amount(){}\nuint public amount;");
+    }
+
+    #[test]
+    fn rename_spans_the_modifier_override_family() {
+        // A virtual modifier and an override of it. A modifier's base ids live
+        // under `baseModifiers`, not `baseFunctions`, so renaming the base must
+        // still reach the override.
+        let text = "modifier m(){_;}\nmodifier m(){_;}";
+        let ast = json!({
+            "id": 1, "nodeType": "SourceUnit", "src": "0:33:0",
+            "nodes": [
+                { "id": 10, "nodeType": "ModifierDefinition", "name": "m",
+                  "nameLocation": "9:1:0", "src": "0:16:0" },
+                { "id": 20, "nodeType": "ModifierDefinition", "name": "m",
+                  "nameLocation": "26:1:0", "src": "17:16:0", "baseModifiers": [10] }
+            ]
+        });
+        let path = "/no-such-dir-solidity-lsp/A.sol";
+        let idx = Index::build(&[src(1, path, text, ast)]);
+        let p = Path::new(path);
+        let edit = idx.rename(p, Position::new(0, 9), "guard").unwrap();
+        let uri = Url::from_file_path(p).unwrap();
+        let edits = edits_for(&edit, &uri);
+        assert_eq!(edits.len(), 2, "base modifier decl + override decl");
+        assert_eq!(apply(text, edits), "modifier guard(){_;}\nmodifier guard(){_;}");
     }
 
     #[test]
