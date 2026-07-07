@@ -6,8 +6,10 @@
   "license": "MIT",
   "publisher": "u-zzam",
   "repository": { "type": "git", "url": "https://github.com/u-zzam/solidity-for-foundry" },
+  "bugs": { "url": "https://github.com/u-zzam/solidity-for-foundry/issues" },
   "engines": { "vscode": "^1.75.0" },
   "categories": ["Programming Languages"],
+  "keywords": ["ethereum", "forge", "foundry", "solidity", "smart contracts"],
   "activationEvents": ["onLanguage:solidity"],
   "main": "./out/extension.js",
   "contributes": {
