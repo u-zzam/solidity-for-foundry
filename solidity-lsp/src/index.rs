@@ -242,6 +242,18 @@ impl Index {
                 if gets(map, "nodeType") == Some("FunctionCall") {
                     collect_call_hints(map, s.index, &mut pending);
                 }
+                // A `UserDefinedTypeName` and its child `IdentifierPath` carry the
+                // same `referencedDeclaration` over the same span, so a type use
+                // (`Foo x;`) would be indexed twice — listed twice in
+                // find-references and, worse, making rename emit two edits on one
+                // range, an edit LSP clients reject. Index only the `IdentifierPath`
+                // (always present since solc 0.8.16); it also gives the precise
+                // per-segment span for a qualified path.
+                if gets(map, "nodeType") == Some("UserDefinedTypeName")
+                    && map.contains_key("pathNode")
+                {
+                    return;
+                }
                 // Reference: points at a declaration.
                 if let Some(refid) = geti(map, "referencedDeclaration") {
                     if refid >= 0 {
@@ -1116,6 +1128,26 @@ mod tests {
         SourceAst { index, path: PathBuf::from(path), ast, text: text.to_string() }
     }
 
+    /// Apply a single file's rename edits to `text`, right-to-left so earlier
+    /// edits don't shift later offsets.
+    fn apply(text: &str, edits: &[TextEdit]) -> String {
+        let m = PositionMapper::new(text);
+        let mut spans: Vec<(usize, usize, &str)> = edits
+            .iter()
+            .map(|e| (m.offset(e.range.start), m.offset(e.range.end), e.new_text.as_str()))
+            .collect();
+        spans.sort_by_key(|s| std::cmp::Reverse(s.0));
+        let mut out = text.to_string();
+        for (s, e, t) in spans {
+            out.replace_range(s..e, t);
+        }
+        out
+    }
+
+    fn edits_for<'a>(edit: &'a WorkspaceEdit, uri: &Url) -> &'a [TextEdit] {
+        edit.changes.as_ref().unwrap().get(uri).unwrap()
+    }
+
     #[test]
     fn index_uses_captured_text_not_disk() {
         // A path that does not exist on disk: the index must still carry its text
@@ -1126,6 +1158,52 @@ mod tests {
         let idx = Index::build(&[src(1, path, "contract A", ast)]);
         assert!(idx.matches(Path::new(path), "contract A"));
         assert!(!idx.matches(Path::new(path), "contract B"));
+    }
+
+    #[test]
+    fn type_reference_indexed_once() {
+        // `Foo a;` — solc emits a UserDefinedTypeName wrapping an IdentifierPath,
+        // both with the same src/referencedDeclaration. The index must record the
+        // type use once, or rename produces two identical edits on one range.
+        let text = "struct Foo{}\ncontract C{Foo a;}";
+        let ast = json!({
+            "id": 1, "nodeType": "SourceUnit", "src": "0:31:0",
+            "nodes": [
+                { "id": 10, "nodeType": "StructDefinition", "name": "Foo",
+                  "nameLocation": "7:3:0", "src": "0:12:0", "members": [] },
+                { "id": 20, "nodeType": "ContractDefinition", "name": "C",
+                  "nameLocation": "22:1:0", "src": "13:18:0", "nodes": [
+                    { "id": 30, "nodeType": "VariableDeclaration", "name": "a",
+                      "nameLocation": "28:1:0", "src": "24:6:0",
+                      "typeName": {
+                        "id": 31, "nodeType": "UserDefinedTypeName", "src": "24:3:0",
+                        "referencedDeclaration": 10,
+                        "pathNode": {
+                            "id": 32, "nodeType": "IdentifierPath", "name": "Foo",
+                            "src": "24:3:0", "nameLocations": ["24:3:0"],
+                            "referencedDeclaration": 10
+                        }
+                      }
+                    }
+                  ]
+                }
+            ]
+        });
+        let path = "/no-such-dir-solidity-lsp/A.sol";
+        let idx = Index::build(&[src(1, path, text, ast)]);
+        let p = Path::new(path);
+        let use_pos = Position::new(1, 11); // on the `Foo` type use
+        assert_eq!(idx.references(p, use_pos, false).len(), 1);
+
+        let edit = idx.rename(p, use_pos, "Bar").unwrap();
+        let uri = Url::from_file_path(p).unwrap();
+        let edits = edits_for(&edit, &uri);
+        // Two edits (declaration + one use), and no two share a range.
+        assert_eq!(edits.len(), 2);
+        let mut ranges: Vec<_> = edits.iter().map(|e| (e.range.start, e.range.end)).collect();
+        ranges.dedup();
+        assert_eq!(ranges.len(), 2, "duplicate edit range");
+        assert_eq!(apply(text, edits), "struct Bar{}\ncontract C{Bar a;}");
     }
 
     #[test]
