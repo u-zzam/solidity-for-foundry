@@ -1090,7 +1090,13 @@ impl LanguageServer for Backend {
         // compile + navigation index in the background.
         self.schedule_live_check_now(doc.uri.clone());
         self.schedule_diagnostics(doc.uri.clone());
-        self.schedule_index(doc.uri);
+        // Only (re)index when this file isn't already covered by a current index.
+        // At open the buffer equals disk, so a matching index is exactly valid and
+        // a fresh cold full compile would just burn CPU — painful when browsing a
+        // large project file by file.
+        if self.valid_index_root(&doc.uri).await.is_none() {
+            self.schedule_index(doc.uri);
+        }
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
