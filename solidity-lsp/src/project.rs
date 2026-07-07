@@ -21,11 +21,15 @@ use foundry_compilers::{ProjectBuilder, ProjectPathsConfig};
 use semver::Version;
 
 /// One source file's solc AST, as raw JSON for generic traversal, tagged with
-/// the source-unit index solc uses in `src` locations.
+/// the source-unit index solc uses in `src` locations. `text` is read here, next
+/// to the AST, so the index's byte offsets and its staleness check use the same
+/// snapshot — reading it later (in `Index::build`) could pick up a save that
+/// landed after the compile, pairing new text with old offsets.
 pub struct SourceAst {
     pub index: usize,
     pub path: PathBuf,
     pub ast: serde_json::Value,
+    pub text: String,
 }
 
 /// Result of compiling a project: diagnostics plus the typed ASTs to index.
@@ -431,7 +435,10 @@ pub fn compile(root: &Path, full: bool) -> Result<CompileOutput, String> {
         if let Some(ast) = &sf.ast {
             if let Ok(value) = serde_json::to_value(ast) {
                 let abs = if path.is_absolute() { path.clone() } else { root.join(path) };
-                sources.push(SourceAst { index: sf.id as usize, path: abs, ast: value });
+                let Ok(text) = std::fs::read_to_string(&abs) else {
+                    continue;
+                };
+                sources.push(SourceAst { index: sf.id as usize, path: abs, ast: value, text });
             }
         }
     }

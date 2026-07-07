@@ -166,9 +166,11 @@ impl Index {
             .collect();
 
         for s in sources {
-            let Ok(text) = std::fs::read_to_string(&s.path) else {
-                continue;
-            };
+            // Use the text captured alongside the AST in `project::compile`, not a
+            // fresh disk read: the offsets in this AST are that snapshot's, and the
+            // staleness gate (`matches`) must compare against it, or a save landing
+            // mid-compile pairs new text with old offsets yet passes the gate.
+            let text = s.text.clone();
             let canon = std::fs::canonicalize(&s.path).unwrap_or_else(|_| s.path.clone());
             let Ok(uri) = Url::from_file_path(&canon) else {
                 continue;
@@ -1106,6 +1108,25 @@ fn parse_src(s: &str) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    /// Build a `SourceAst` from an inline AST and text (no disk access), so the
+    /// index can be exercised without a real solc run.
+    fn src(index: usize, path: &str, text: &str, ast: Value) -> SourceAst {
+        SourceAst { index, path: PathBuf::from(path), ast, text: text.to_string() }
+    }
+
+    #[test]
+    fn index_uses_captured_text_not_disk() {
+        // A path that does not exist on disk: the index must still carry its text
+        // (captured next to the AST at compile time) so the staleness gate can
+        // compare byte-for-byte. A later disk read would defeat that gate.
+        let ast = json!({ "id": 1, "nodeType": "SourceUnit", "src": "0:10:0", "nodes": [] });
+        let path = "/no-such-dir-solidity-lsp/A.sol";
+        let idx = Index::build(&[src(1, path, "contract A", ast)]);
+        assert!(idx.matches(Path::new(path), "contract A"));
+        assert!(!idx.matches(Path::new(path), "contract B"));
+    }
 
     #[test]
     fn parses_src_locations() {
