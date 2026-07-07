@@ -116,7 +116,14 @@ impl Backend {
         for (uri, mut ds) in diagnostics::group_lints(&lints) {
             new.entry(uri).or_default().append(&mut ds);
         }
-        *self.state.fixes.lock().await = diagnostics::lint_fixes(&lints);
+        // Replace only this root's lint fixes. `fixes` is one global map shared
+        // across every open project, so overwriting it wholesale would drop
+        // another root's quick-fixes; keep entries outside this root, swap ours.
+        {
+            let mut fixes = self.state.fixes.lock().await;
+            fixes.retain(|uri, _| uri.to_file_path().map_or(true, |p| !p.starts_with(&root)));
+            fixes.extend(diagnostics::lint_fixes(&lints));
+        }
 
         let total: usize = new.values().map(Vec::len).sum();
         self.client
@@ -150,7 +157,11 @@ impl Backend {
             if new.contains_key(uri) {
                 continue;
             }
-            if self.is_dirty(uri).await {
+            // Diagnostics for another project (or a standalone file) live in the
+            // same global set; this compile said nothing about them, so preserve
+            // them rather than wiping a different root's squiggles.
+            let outside_root = uri.to_file_path().map_or(true, |p| !p.starts_with(&root));
+            if outside_root || self.is_dirty(uri).await {
                 next.insert(uri.clone());
                 continue;
             }
