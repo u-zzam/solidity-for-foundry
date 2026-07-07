@@ -50,6 +50,9 @@ struct State {
     live_versions: Mutex<HashMap<Url, i32>>,
     /// forge lint quick-fixes from the last compile, per URI, for code actions.
     fixes: Mutex<HashMap<Url, Vec<diagnostics::LintFix>>>,
+    /// Roots we've already warned about an unparseable foundry.toml, so the
+    /// "using default settings" notice logs once, not on every compile.
+    warned_config: Mutex<HashSet<PathBuf>>,
 }
 
 /// Clears a root from the in-flight indexing set when dropped, so a panic during
@@ -87,6 +90,23 @@ impl Backend {
                 .await;
             return;
         };
+
+        // A foundry.toml that won't parse silently falls back to default
+        // settings (no pinned solc, no inline remappings), so diagnostics can
+        // drift from `forge build`. Surface that once per root.
+        if let Some(err) = project::config_parse_error(&root) {
+            if self.state.warned_config.lock().await.insert(root.clone()) {
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!(
+                            "foundry.toml in {} failed to parse ({err}); using default settings",
+                            root.display()
+                        ),
+                    )
+                    .await;
+            }
+        }
 
         let _guard = self.state.compiling.lock().await;
         let r = root.clone();

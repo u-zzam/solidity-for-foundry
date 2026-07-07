@@ -285,6 +285,14 @@ fn glob_match(pat: &str, path: &str) -> bool {
     pi == p.len()
 }
 
+/// If `root/foundry.toml` exists but isn't valid TOML, the parse error.
+/// `parse_config` silently falls back to defaults on a broken file (losing the
+/// pinned solc, inline remappings, and layout), so a caller can surface this.
+pub fn config_parse_error(root: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(root.join("foundry.toml")).ok()?;
+    text.parse::<toml::Table>().err().map(|e| e.to_string())
+}
+
 fn parse_config(root: &Path) -> Config {
     // forge selects the active profile from `FOUNDRY_PROFILE` (default
     // "default"), so an editor launched from a shell with that set must compile
@@ -772,6 +780,20 @@ mod tests {
         // No pragma, or no concrete x.y.z, yields nothing.
         assert_eq!(detect_solc("contract C {}"), None);
         assert_eq!(detect_solc("pragma solidity ^0.8;"), None);
+    }
+
+    #[test]
+    fn config_parse_error_flags_broken_toml() {
+        let root = temp_dir();
+        // No file at all: nothing to report.
+        assert_eq!(config_parse_error(&root), None);
+        // Valid TOML: no error.
+        std::fs::write(root.join("foundry.toml"), "[profile.default]\nsolc = \"0.8.19\"\n").unwrap();
+        assert_eq!(config_parse_error(&root), None);
+        // Broken TOML: an error string is returned.
+        std::fs::write(root.join("foundry.toml"), "[profile.default\nsolc = ").unwrap();
+        assert!(config_parse_error(&root).is_some());
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
