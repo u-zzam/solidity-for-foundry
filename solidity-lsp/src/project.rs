@@ -721,6 +721,21 @@ pub fn source_fingerprint(root: &Path) -> u64 {
     h.finish()
 }
 
+/// Every `.sol` file under the project's configured source, test and script
+/// directories, for the whole-project background parse that keeps navigation
+/// working before the first successful compile and through broken builds. `lib/`
+/// is intentionally excluded — vendored dependencies aren't renamed or listed as
+/// project symbols, and parsing an entire dependency tree on every root is
+/// costly; the solc index already covers them once a compile succeeds.
+pub fn source_files(root: &Path) -> Vec<PathBuf> {
+    let cfg = parse_config(root);
+    let mut files = Vec::new();
+    for d in [cfg.src, cfg.tests, cfg.scripts] {
+        collect_sol(&root.join(d), &mut files);
+    }
+    files.into_iter().map(|(p, _, _)| p).collect()
+}
+
 /// Recursively collect every `.sol` file under `dir` with its mtime and length.
 /// `read_dir`'s file type doesn't follow symlinks, so a symlinked directory is
 /// simply skipped — no risk of a cyclic walk.
@@ -1024,6 +1039,31 @@ mod tests {
         std::fs::write(src.join("B.sol"), "contract B { uint256 x; }").unwrap();
         assert_ne!(fp2, source_fingerprint(&root));
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn source_files_span_project_dirs_but_not_libs() {
+        let root = temp_dir();
+        for d in ["src", "test", "script", "lib/oz"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("foundry.toml"), "[profile.default]\n").unwrap();
+        std::fs::write(root.join("src/A.sol"), "contract A {}").unwrap();
+        std::fs::write(root.join("test/A.t.sol"), "contract AT {}").unwrap();
+        std::fs::write(root.join("script/A.s.sol"), "contract AS {}").unwrap();
+        std::fs::write(root.join("src/README.md"), "not solidity").unwrap();
+        std::fs::write(root.join("lib/oz/O.sol"), "contract O {}").unwrap();
+
+        let files = source_files(&root);
+        let names: Vec<String> =
+            files.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert!(names.contains(&"A.sol".to_string()), "{names:?}");
+        assert!(names.contains(&"A.t.sol".to_string()), "{names:?}");
+        assert!(names.contains(&"A.s.sol".to_string()), "{names:?}");
+        // Non-Solidity files and vendored lib sources are excluded.
+        assert!(!names.contains(&"README.md".to_string()), "{names:?}");
+        assert!(!names.contains(&"O.sol".to_string()), "lib excluded: {names:?}");
         std::fs::remove_dir_all(&root).ok();
     }
 

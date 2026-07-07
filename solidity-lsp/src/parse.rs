@@ -113,6 +113,7 @@ impl DefKind {
 }
 
 /// A named declaration found in the buffer.
+#[derive(Clone)]
 struct Def {
     name: String,
     kind: DefKind,
@@ -140,6 +141,7 @@ struct Def {
 
 /// One identifier occurrence (declaration site or reference), for cursor
 /// resolution, find-references and document highlight.
+#[derive(Clone)]
 struct Ident {
     name: String,
     start: usize,
@@ -150,6 +152,7 @@ struct Ident {
 
 /// A call site (`f(a, b)`, `emit E(x)`, `mod(y)`) and its positional arguments,
 /// for call-site parameter-name inlay hints.
+#[derive(Clone)]
 struct Call {
     callee: String,
     args: Vec<Arg>,
@@ -158,6 +161,7 @@ struct Call {
 /// One positional argument: where its expression starts, and the argument's own
 /// identifier when it is a bare name (so a hint that would merely repeat the
 /// parameter name can be suppressed).
+#[derive(Clone)]
 struct Arg {
     byte: usize,
     ident: Option<String>,
@@ -165,6 +169,7 @@ struct Arg {
 
 /// An import path literal and the span of the quoted string, so clicking the
 /// path can open the imported file.
+#[derive(Clone)]
 struct ImportPath {
     /// The path as written, without the surrounding quotes (`./X.sol`).
     path: String,
@@ -173,6 +178,7 @@ struct ImportPath {
 }
 
 /// A single parsed buffer.
+#[derive(Clone)]
 pub struct File {
     pub text: String,
     defs: Vec<Def>,
@@ -587,9 +593,12 @@ pub fn definition(files: &HashMap<Url, File>, uri: &Url, pos: Position) -> Vec<L
         if u == uri {
             continue;
         }
-        let m = PositionMapper::new(&f.text);
+        // Build the O(file-size) mapper only once a file actually contributes a
+        // hit — over a whole-project map most files match nothing.
+        let mut m: Option<PositionMapper> = None;
         for d in f.defs.iter().filter(|d| d.name == name) {
-            out.push(make_location(u, &m, d.name_start, d.name_end));
+            let m = m.get_or_insert_with(|| PositionMapper::new(&f.text));
+            out.push(make_location(u, m, d.name_start, d.name_end));
         }
     }
     out
@@ -611,9 +620,11 @@ pub fn references(
     };
     let mut out = Vec::new();
     for (u, f) in files {
-        let m = PositionMapper::new(&f.text);
+        // Build the O(file-size) mapper only for files that actually hold a hit.
+        let mut m: Option<PositionMapper> = None;
         for i in f.idents.iter().filter(|i| i.name == name && (include_decl || !i.is_def)) {
-            out.push(make_location(u, &m, i.start, i.end));
+            let m = m.get_or_insert_with(|| PositionMapper::new(&f.text));
+            out.push(make_location(u, m, i.start, i.end));
         }
     }
     out
@@ -706,7 +717,9 @@ pub fn workspace_symbols(files: &HashMap<Url, File>, query: &str) -> Vec<SymbolI
     let q = query.to_lowercase();
     let mut out = Vec::new();
     for (uri, f) in files {
-        let m = PositionMapper::new(&f.text);
+        // Build the O(file-size) mapper lazily: over a whole-project map, a
+        // specific query matches nothing in most files, so they need no mapper.
+        let mut mapper: Option<PositionMapper> = None;
         for d in &f.defs {
             if matches!(d.kind, DefKind::Local | DefKind::Param) {
                 continue;
@@ -714,13 +727,14 @@ pub fn workspace_symbols(files: &HashMap<Url, File>, query: &str) -> Vec<SymbolI
             if !q.is_empty() && !d.name.to_lowercase().contains(&q) {
                 continue;
             }
+            let m = mapper.get_or_insert_with(|| PositionMapper::new(&f.text));
             #[allow(deprecated)]
             out.push(SymbolInformation {
                 name: d.name.clone(),
                 kind: d.kind.symbol_kind(),
                 tags: None,
                 deprecated: None,
-                location: make_location(uri, &m, d.name_start, d.name_end),
+                location: make_location(uri, m, d.name_start, d.name_end),
                 container_name: d.container.map(|i| f.defs[i].name.clone()),
             });
         }

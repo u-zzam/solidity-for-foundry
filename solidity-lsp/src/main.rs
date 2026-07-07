@@ -28,6 +28,17 @@ struct State {
     /// navigation instantly (no compile, no foundry.toml) and while typing; the
     /// solc index is preferred only when it has valid, non-stale positions.
     parsed: RwLock<HashMap<Url, parse::File>>,
+    /// Per Foundry root, a background tree-sitter parse of every project source
+    /// (src/test/script). It lets go-to-definition, references, workspace symbols
+    /// and member completion span the whole project the moment a root is
+    /// recognized — before any successful compile and through broken builds, when
+    /// only open buffers would otherwise resolve. Open buffers are mirrored in
+    /// live so their unsaved content wins over the disk snapshot.
+    workspace_parsed: RwLock<HashMap<PathBuf, HashMap<Url, parse::File>>>,
+    /// Roots whose background parse has been kicked off, so the one-shot glob +
+    /// parse runs once per root (the watched-files handler re-arms it on external
+    /// change).
+    workspace_roots: Mutex<HashSet<PathBuf>>,
     /// URIs we last published diagnostics for, so we can clear stale ones.
     published: Mutex<HashSet<Url>>,
     /// Serializes project compiles; one solc run at a time is plenty for an editor.
@@ -233,6 +244,115 @@ impl Backend {
         };
         // A buffer with no readable file on disk is unsaved -> live owns it.
         std::fs::read_to_string(&path).map_or(true, |disk| disk != buffer)
+    }
+
+    /// Run a live-parser navigation query for `uri` against the best map: the
+    /// owning root's whole-project background parse (open buffers overlaid) when
+    /// it's ready, else just the open buffers. Consulted only when the solc index
+    /// can't answer (cold start, broken build, config-less file), so a query
+    /// still spans the project instead of only what happens to be open.
+    async fn with_nav_map<T>(
+        &self,
+        uri: &Url,
+        f: impl FnOnce(&HashMap<Url, parse::File>) -> T,
+    ) -> T {
+        if let Some(root) = uri.to_file_path().ok().and_then(|p| project::locate_root(&p)) {
+            let ws = self.state.workspace_parsed.read().await;
+            if let Some(map) = ws.get(&root) {
+                return f(map);
+            }
+        }
+        let parsed = self.state.parsed.read().await;
+        f(&parsed)
+    }
+
+    /// Parse every project source of `root` in the background (once per root), so
+    /// navigation spans the whole project even before the first compile. Off the
+    /// message loop; the live parser answers meanwhile. Any currently-open buffer
+    /// is overlaid so its unsaved parse wins over the disk snapshot.
+    fn schedule_workspace_parse(&self, root: PathBuf) {
+        let me = self.clone();
+        tokio::spawn(async move {
+            if !me.state.workspace_roots.lock().await.insert(root.clone()) {
+                return; // already parsed (re-armed by the watched-files handler)
+            }
+            let r = root.clone();
+            let disk = tokio::task::spawn_blocking(move || {
+                project::source_files(&r)
+                    .into_iter()
+                    .filter_map(|path| {
+                        let text = std::fs::read_to_string(&path).ok()?;
+                        Some((Url::from_file_path(&path).ok()?, parse::parse(&text)))
+                    })
+                    .collect::<HashMap<Url, parse::File>>()
+            })
+            .await;
+            let Ok(mut map) = disk else {
+                me.state.workspace_roots.lock().await.remove(&root);
+                return;
+            };
+            // Overlay open buffers in this root: their unsaved text supersedes the
+            // disk snapshot read above.
+            {
+                let parsed = me.state.parsed.read().await;
+                for (uri, file) in parsed.iter() {
+                    if uri.to_file_path().ok().and_then(|p| project::locate_root(&p)).as_deref()
+                        == Some(root.as_path())
+                    {
+                        map.insert(uri.clone(), file.clone());
+                    }
+                }
+            }
+            me.state.workspace_parsed.write().await.insert(root, map);
+        });
+    }
+
+    /// Mirror an open buffer's fresh parse into its root's whole-project map, so
+    /// project-wide navigation sees unsaved edits (open buffers win over the disk
+    /// snapshot). A no-op until the root's background parse has populated the map.
+    async fn sync_workspace_buffer(&self, uri: &Url, file: parse::File) {
+        let Some(root) = uri.to_file_path().ok().and_then(|p| project::locate_root(&p)) else {
+            return;
+        };
+        if let Some(map) = self.state.workspace_parsed.write().await.get_mut(&root) {
+            map.insert(uri.clone(), file);
+        }
+    }
+
+    /// Restore the on-disk parse of `uri` in its root's whole-project map after a
+    /// buffer with unsaved edits is closed (the edits are discarded, so the map's
+    /// mirrored copy is now stale). Drops the entry if the file is gone from disk.
+    fn refresh_workspace_file(&self, uri: Url) {
+        let me = self.clone();
+        tokio::spawn(async move {
+            let Some(root) = uri.to_file_path().ok().and_then(|p| project::locate_root(&p)) else {
+                return;
+            };
+            // Only touch a root that's already been parsed in the background.
+            if !me.state.workspace_parsed.read().await.contains_key(&root) {
+                return;
+            }
+            let u = uri.clone();
+            let parsed = tokio::task::spawn_blocking(move || {
+                u.to_file_path()
+                    .ok()
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+                    .map(|t| parse::parse(&t))
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(map) = me.state.workspace_parsed.write().await.get_mut(&root) {
+                match parsed {
+                    Some(file) => {
+                        map.insert(uri, file);
+                    }
+                    None => {
+                        map.remove(&uri);
+                    }
+                }
+            }
+        });
     }
 
     /// Rebuild the accuracy index from a full compile of the owning project.
@@ -674,15 +794,19 @@ impl LanguageServer for Backend {
                 }
             }
         }
-        // Live parser fallback (cold start, mid-edit, or no foundry.toml).
-        let parsed = self.state.parsed.read().await;
-        // An import path opens the imported file; relative paths resolve here even
-        // without an index (remapped ones come from the index above).
-        if let Some(loc) = parse::import_definition(parsed.get(&uri), &uri, p.position) {
-            return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
-        }
-        let locs = parse::definition(&parsed, &uri, p.position);
-        Ok((!locs.is_empty()).then_some(GotoDefinitionResponse::Array(locs)))
+        // Live parser fallback (cold start, mid-edit, or no foundry.toml), across
+        // the whole project when the background parse is ready, else open buffers.
+        Ok(self
+            .with_nav_map(&uri, |m| {
+                // An import path opens the imported file; relative paths resolve
+                // here even without an index (remapped ones come from the index).
+                if let Some(loc) = parse::import_definition(m.get(&uri), &uri, p.position) {
+                    return Some(GotoDefinitionResponse::Scalar(loc));
+                }
+                let locs = parse::definition(m, &uri, p.position);
+                (!locs.is_empty()).then_some(GotoDefinitionResponse::Array(locs))
+            })
+            .await)
     }
 
     async fn goto_type_definition(
@@ -744,8 +868,9 @@ impl LanguageServer for Backend {
                 }
             }
         }
-        let parsed = self.state.parsed.read().await;
-        let locs = parse::references(&parsed, &uri, p.position, include);
+        let locs = self
+            .with_nav_map(&uri, |m| parse::references(m, &uri, p.position, include))
+            .await;
         Ok((!locs.is_empty()).then_some(locs))
     }
 
@@ -849,8 +974,23 @@ impl LanguageServer for Backend {
             }
         }
 
-        let parsed = self.state.parsed.read().await;
-        for s in parse::workspace_symbols(&parsed, query) {
+        // Live-parser candidates: every project source via the whole-project
+        // background parses (so a root whose index isn't ready — cold start,
+        // broken build — is still searchable), plus the open buffers (for a
+        // standalone file, or one no root covers). Open buffers appear in both and
+        // are deduped by (uri, name).
+        let mut candidates: Vec<SymbolInformation> = Vec::new();
+        {
+            let ws = self.state.workspace_parsed.read().await;
+            for map in ws.values() {
+                candidates.extend(parse::workspace_symbols(map, query));
+            }
+        }
+        {
+            let parsed = self.state.parsed.read().await;
+            candidates.extend(parse::workspace_symbols(&parsed, query));
+        }
+        for s in candidates {
             let uri = &s.location.uri;
             // Skip files the index covers unless they have unsaved edits.
             if covered.contains(uri) && !dirty.contains(uri) {
@@ -904,8 +1044,9 @@ impl LanguageServer for Backend {
                         items.extend(idx.member_completions(c));
                     }
                 } else {
-                    let parsed = self.state.parsed.read().await;
-                    items.extend(parse::member_completions(&parsed, c));
+                    let more =
+                        self.with_nav_map(&uri, |m| parse::member_completions(m, c)).await;
+                    items.extend(more);
                 }
             }
             None => {
@@ -1166,6 +1307,9 @@ impl LanguageServer for Backend {
         // before (and independent of) the background compile and index.
         let file = parse::parse(&doc.text);
         self.state.docs.write().await.insert(doc.uri.clone(), doc.text);
+        // Mirror into the whole-project map (if its root is already parsed) before
+        // moving the parse into the open-buffer map.
+        self.sync_workspace_buffer(&doc.uri, file.clone()).await;
         self.state.parsed.write().await.insert(doc.uri.clone(), file);
         // Fast type-check first (instant feedback), then the full codegen
         // compile + navigation index in the background.
@@ -1176,7 +1320,12 @@ impl LanguageServer for Backend {
         // a fresh cold full compile would just burn CPU — painful when browsing a
         // large project file by file.
         if self.valid_index_root(&doc.uri).await.is_none() {
-            self.schedule_index(doc.uri);
+            self.schedule_index(doc.uri.clone());
+        }
+        // Parse the whole owning project in the background the first time we see
+        // its root, so navigation spans it even before any compile succeeds.
+        if let Some(root) = doc.uri.to_file_path().ok().and_then(|p| project::locate_root(&p)) {
+            self.schedule_workspace_parse(root);
         }
     }
 
@@ -1200,6 +1349,7 @@ impl LanguageServer for Backend {
                     return;
                 };
                 if me.state.live_versions.lock().await.get(&u).copied() == Some(version) {
+                    me.sync_workspace_buffer(&u, file.clone()).await;
                     me.state.parsed.write().await.insert(u, file);
                 }
             });
@@ -1227,6 +1377,9 @@ impl LanguageServer for Backend {
         // that guard fail (None != Some(version)).
         self.state.live_versions.lock().await.remove(&uri);
         if was_dirty {
+            // The whole-project map mirrored the now-discarded edits; re-parse the
+            // file from disk so project-wide navigation reflects the saved truth.
+            self.refresh_workspace_file(uri.clone());
             // Clear the stale diagnostics, then restore the on-disk truth: a
             // Foundry file gets a fresh compile (which republishes any real
             // on-disk errors); a standalone file has nothing to recompile.
@@ -1267,6 +1420,11 @@ impl LanguageServer for Backend {
         // memo wouldn't otherwise notice.
         for root in &roots {
             project::invalidate_root(root);
+            // Re-arm the whole-project background parse: a branch switch or forge
+            // install can add, remove or edit .sol files outside any open buffer,
+            // which the mirrored open-buffer syncs wouldn't otherwise pick up.
+            self.state.workspace_roots.lock().await.remove(root);
+            self.schedule_workspace_parse(root.clone());
         }
         // One compile + index per affected root, keyed off any open buffer in it.
         // The warm incremental compile republishes and clears diagnostics across
