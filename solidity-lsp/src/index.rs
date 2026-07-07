@@ -573,14 +573,36 @@ impl Index {
         let id = self.resolve(path, pos)?;
         let d = self.decls.get(&id)?;
         let mut md = format!("```solidity\n{}\n```", d.signature_text());
-        if let Some(doc) = &d.doc {
-            let natspec = format_natspec(doc);
-            if !natspec.is_empty() {
-                md.push_str("\n\n");
-                md.push_str(&natspec);
-            }
+        if let Some(natspec) = self.inherited_doc(id) {
+            md.push_str("\n\n");
+            md.push_str(&natspec);
         }
         Some(md)
+    }
+
+    /// The NatSpec to render for `id`: its own, or — when that is empty or only
+    /// `@inheritdoc` (which renders nothing) — the nearest documented base
+    /// function's, walking the override edges. Surfaces docs for implementations
+    /// carrying just `@inheritdoc`, the OZ/aave convention (docs on the interface,
+    /// `@inheritdoc` on the implementation).
+    fn inherited_doc(&self, id: i64) -> Option<String> {
+        let mut seen = HashSet::new();
+        let mut stack = vec![id];
+        while let Some(x) = stack.pop() {
+            if !seen.insert(x) {
+                continue;
+            }
+            if let Some(doc) = self.decls.get(&x).and_then(|d| d.doc.as_deref()) {
+                let natspec = format_natspec(doc);
+                if !natspec.is_empty() {
+                    return Some(natspec);
+                }
+            }
+            if let Some(base_fns) = self.bases.get(&x) {
+                stack.extend(base_fns.iter().copied());
+            }
+        }
+        None
     }
 
     /// Every function in the override family of `id`: itself, the base functions
@@ -1513,6 +1535,33 @@ mod tests {
         assert_eq!(idx.references(p, Position::new(0, 7), false), Some(Vec::new()));
         // On the trailing `}`: nothing resolves.
         assert_eq!(idx.references(p, Position::new(0, 11), false), None);
+    }
+
+    #[test]
+    fn hover_falls_back_to_inherited_natspec() {
+        // A base function with NatSpec, and an override documented only with
+        // `@inheritdoc` (which renders nothing). Hovering the override must show
+        // the base's docs, not a bare signature.
+        let text = "function foo(){}\nfunction foo(){}";
+        let ast = json!({
+            "id": 1, "nodeType": "SourceUnit", "src": "0:33:0", "nodes": [
+                { "id": 10, "nodeType": "FunctionDefinition", "name": "foo", "kind": "function",
+                  "nameLocation": "9:3:0", "src": "0:16:0",
+                  "documentation": { "nodeType": "StructuredDocumentation", "text": "@notice does a thing" } },
+                { "id": 20, "nodeType": "FunctionDefinition", "name": "foo", "kind": "function",
+                  "nameLocation": "26:3:0", "src": "17:16:0", "baseFunctions": [10],
+                  "documentation": { "nodeType": "StructuredDocumentation", "text": "@inheritdoc IFoo" } }
+            ]
+        });
+        let path = "/no-such-dir-solidity-lsp/A.sol";
+        let idx = Index::build(&[src(1, path, text, ast)]);
+        let p = Path::new(path);
+        // The override (line 1) inherits the base's notice.
+        let md = idx.hover(p, Position::new(1, 9)).unwrap();
+        assert!(md.contains("does a thing"), "{md}");
+        assert!(!md.contains("inheritdoc"), "{md}");
+        // The base still shows its own docs.
+        assert!(idx.hover(p, Position::new(0, 9)).unwrap().contains("does a thing"));
     }
 
     #[test]
