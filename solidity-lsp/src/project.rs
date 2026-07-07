@@ -693,6 +693,64 @@ pub fn remapping_prefixes(root: &Path) -> Vec<String> {
     names
 }
 
+/// A cheap change signature for a project's source tree: every `.sol` file under
+/// the configured source/test/script/lib dirs (plus foundry.toml and
+/// remappings.txt), hashed by path, mtime and length. Two calls return the same
+/// value only when nothing was added, removed or modified, so the navigation
+/// index can skip a full cold recompile that would just reproduce the same AST.
+/// A file whose metadata can't be read still contributes its path, so a new file
+/// always changes the signature even if its mtime is momentarily unreadable.
+pub fn source_fingerprint(root: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let cfg = parse_config(root);
+    let mut files: Vec<(PathBuf, u64, u64)> = Vec::new();
+    let mut dirs = vec![cfg.src, cfg.tests, cfg.scripts];
+    dirs.extend(cfg.libs);
+    for d in dirs {
+        collect_sol(&root.join(d), &mut files);
+    }
+    for name in ["foundry.toml", "remappings.txt"] {
+        let p = root.join(name);
+        if let Ok(m) = std::fs::metadata(&p) {
+            files.push((p, mtime_nanos(&m), m.len()));
+        }
+    }
+    files.sort();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    files.hash(&mut h);
+    h.finish()
+}
+
+/// Recursively collect every `.sol` file under `dir` with its mtime and length.
+/// `read_dir`'s file type doesn't follow symlinks, so a symlinked directory is
+/// simply skipped — no risk of a cyclic walk.
+fn collect_sol(dir: &Path, out: &mut Vec<(PathBuf, u64, u64)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if ft.is_dir() {
+            collect_sol(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("sol") {
+            let (mtime, len) =
+                entry.metadata().map(|m| (mtime_nanos(&m), m.len())).unwrap_or((0, 0));
+            out.push((path, mtime, len));
+        }
+    }
+}
+
+fn mtime_nanos(m: &std::fs::Metadata) -> u64 {
+    m.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
 /// Detect a concrete solc version from the file's `pragma solidity` line, for
 /// config-less single-file checking. Returns the first `x.y.z` the line names
 /// (e.g. the lower bound of `>=0.8.0 <0.9.0`, or the base of `^0.8.20`).
@@ -942,6 +1000,30 @@ mod tests {
         let cov = config_for(&root, "coverage");
         assert_eq!(cov.via_ir, Some(true));
         assert_eq!(cov.solc, Some(Version::new(0, 8, 19)));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn source_fingerprint_tracks_tree_changes() {
+        let root = temp_dir();
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(root.join("foundry.toml"), "[profile.default]\n").unwrap();
+        std::fs::write(src.join("A.sol"), "contract A {}").unwrap();
+
+        // Stable across repeated calls when nothing changes.
+        let fp1 = source_fingerprint(&root);
+        assert_eq!(fp1, source_fingerprint(&root));
+
+        // A new source file changes the signature (so a rebuild is not skipped).
+        std::fs::write(src.join("B.sol"), "contract B {}").unwrap();
+        let fp2 = source_fingerprint(&root);
+        assert_ne!(fp1, fp2);
+
+        // Editing content (longer file) changes it too.
+        std::fs::write(src.join("B.sol"), "contract B { uint256 x; }").unwrap();
+        assert_ne!(fp2, source_fingerprint(&root));
+
         std::fs::remove_dir_all(&root).ok();
     }
 

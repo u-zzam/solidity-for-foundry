@@ -53,6 +53,11 @@ struct State {
     diag_gen: Mutex<HashMap<PathBuf, u64>>,
     /// Latest document version per URI, to debounce live as-you-type checks.
     live_versions: Mutex<HashMap<Url, i32>>,
+    /// Source-tree signature of each root's last successful index build, so a
+    /// rebuild whose sources are byte-for-byte unchanged (e.g. a save with no
+    /// edits, or a watched-files event on an untouched file) can skip the full
+    /// cold compile instead of reproducing the identical AST.
+    index_fingerprint: Mutex<HashMap<PathBuf, u64>>,
     /// forge lint quick-fixes from the last compile, per URI, for code actions.
     fixes: Mutex<HashMap<Url, Vec<diagnostics::LintFix>>>,
     /// Roots we've already warned about an unparseable foundry.toml, so the
@@ -258,23 +263,46 @@ impl Backend {
         // of the awaits below), so a failed build never blocks re-indexing.
         let _guard = IndexingGuard { state: self.state.clone(), root: root.clone() };
 
+        // Skip a rebuild that would reproduce the current index: if no source file
+        // changed since the last successful build, the full cold compile is wasted
+        // work (the live parser already answers navigation regardless).
+        let fingerprint = {
+            let r = root.clone();
+            tokio::task::spawn_blocking(move || project::source_fingerprint(&r)).await.ok()
+        };
+        if let Some(fp) = fingerprint {
+            let unchanged = self.state.index_fingerprint.lock().await.get(&root) == Some(&fp)
+                && self.state.index.read().await.contains_key(&root);
+            if unchanged {
+                return;
+            }
+        }
+
         // Show "Indexing…" in the editor so navigation-not-ready reads as
         // in-progress, not broken, during the full compile.
         let token = self.progress_begin("Indexing Solidity project").await;
         let r = root.clone();
-        let built = tokio::task::spawn_blocking(move || {
-            project::compile(&r, true).map(|out| {
-                // solc emits no ASTs when the project has errors. Keep the last
-                // good index in that case so navigation stays usable (stale)
-                // while broken code is being edited.
-                (!out.sources.is_empty()).then(|| index::Index::build(&out.sources))
+        let built = {
+            // Share the diagnostics compile lock so the index's full solc run and a
+            // diagnostics compile never drive two solc pipelines at once.
+            let _compiling = self.state.compiling.lock().await;
+            tokio::task::spawn_blocking(move || {
+                project::compile(&r, true).map(|out| {
+                    // solc emits no ASTs when the project has errors. Keep the last
+                    // good index in that case so navigation stays usable (stale)
+                    // while broken code is being edited.
+                    (!out.sources.is_empty()).then(|| index::Index::build(&out.sources))
+                })
             })
-        })
-        .await;
+            .await
+        };
         self.progress_end(token).await;
         match built {
             Ok(Ok(Some(idx))) => {
                 self.state.index.write().await.insert(root.clone(), idx);
+                if let Some(fp) = fingerprint {
+                    self.state.index_fingerprint.lock().await.insert(root.clone(), fp);
+                }
                 // Tell the editor to re-pull the features derived from this index.
                 // Without these, rebuilt inlay hints and semantic tokens sit unused
                 // until the user happens to scroll, edit, or refocus — which reads
