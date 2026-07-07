@@ -233,6 +233,17 @@ impl Default for Config {
 }
 
 fn parse_config(root: &Path) -> Config {
+    // forge selects the active profile from `FOUNDRY_PROFILE` (default
+    // "default"), so an editor launched from a shell with that set must compile
+    // with the same settings forge would.
+    let profile = std::env::var("FOUNDRY_PROFILE").unwrap_or_default();
+    config_for(root, &profile)
+}
+
+/// Parse `foundry.toml` for the named profile. The selected profile inherits
+/// from `profile.default` and overrides it key by key (figment-style), matching
+/// forge's profile resolution.
+fn config_for(root: &Path, profile: &str) -> Config {
     let mut cfg = Config::default();
     let Ok(text) = std::fs::read_to_string(root.join("foundry.toml")) else {
         return cfg;
@@ -240,12 +251,26 @@ fn parse_config(root: &Path) -> Config {
     let Ok(table) = text.parse::<toml::Table>() else {
         return cfg;
     };
-    let Some(p) = table
-        .get("profile")
-        .and_then(|p| p.get("default"))
-        .and_then(|d| d.as_table())
-    else {
-        return cfg;
+    let profiles = table.get("profile").and_then(|p| p.as_table());
+    let get = |name: &str| profiles.and_then(|t| t.get(name)).and_then(|d| d.as_table());
+    let default = get("default");
+    // The active profile's keys overlay `default`. An unset/"default" profile is
+    // just `default`; a named profile with no `default` table starts from the
+    // built-in Config::default() (forge's defaults), same as forge.
+    let selected = (!profile.is_empty() && profile != "default")
+        .then(|| get(profile))
+        .flatten();
+    let p = match (default, selected) {
+        (None, None) => return cfg,
+        (Some(d), None) => d.clone(),
+        (None, Some(s)) => s.clone(),
+        (Some(d), Some(s)) => {
+            let mut merged = d.clone();
+            for (k, v) in s {
+                merged.insert(k.clone(), v.clone());
+            }
+            merged
+        }
     };
 
     let str_field = |k: &str| p.get(k).and_then(|v| v.as_str());
@@ -612,6 +637,24 @@ mod tests {
         // No pragma, or no concrete x.y.z, yields nothing.
         assert_eq!(detect_solc("contract C {}"), None);
         assert_eq!(detect_solc("pragma solidity ^0.8;"), None);
+    }
+
+    #[test]
+    fn selected_profile_overlays_default() {
+        let root = temp_dir();
+        std::fs::write(
+            root.join("foundry.toml"),
+            "[profile.default]\nsolc = \"0.8.19\"\nvia_ir = false\n\
+             [profile.coverage]\nvia_ir = true\n",
+        )
+        .unwrap();
+        // The default profile is used as-is.
+        assert_eq!(config_for(&root, "default").via_ir, Some(false));
+        // The coverage profile overrides via_ir but inherits solc from default.
+        let cov = config_for(&root, "coverage");
+        assert_eq!(cov.via_ir, Some(true));
+        assert_eq!(cov.solc, Some(Version::new(0, 8, 19)));
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
