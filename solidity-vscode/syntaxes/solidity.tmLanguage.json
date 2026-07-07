@@ -111,11 +111,11 @@
         },
         {
           "name": "keyword.other.declaration.solidity",
-          "match": "\\b(contract|interface|library|function|modifier|event|error|struct|enum|mapping|constructor|fallback|receive|using|is|new|delete|type)\\b"
+          "match": "\\b(abstract|contract|interface|library|function|modifier|event|error|struct|enum|mapping|constructor|fallback|receive|using|is|new|delete|type)\\b"
         },
         {
           "name": "storage.modifier.solidity",
-          "match": "\\b(public|private|internal|external|pure|view|payable|constant|immutable|memory|storage|calldata|virtual|override|returns|anonymous|indexed)\\b"
+          "match": "\\b(public|private|internal|external|pure|view|payable|constant|immutable|memory|storage|calldata|transient|virtual|override|returns|anonymous|indexed)\\b"
         }
       ]
     },
