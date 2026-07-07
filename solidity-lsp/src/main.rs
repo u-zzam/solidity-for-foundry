@@ -657,17 +657,45 @@ impl LanguageServer for Backend {
         &self,
         params: WorkspaceSymbolParams,
     ) -> Result<Option<Vec<SymbolInformation>>> {
-        // Search every open project's index so workspace symbols span a monorepo;
-        // fall back to the open buffers before any compile has produced one.
+        // Search every open project's index so workspace symbols span a monorepo,
+        // then fold in the live parser for what the index can't answer for yet:
+        // open buffers with unsaved edits, and files no index covers (a brand-new
+        // file, or a project stuck on a compile error so its index never
+        // refreshed). Short-circuiting on a non-empty index left new/unsaved
+        // symbols unfindable — forever if the project won't compile.
+        let query = &params.query;
         let guard = self.state.index.read().await;
-        if !guard.is_empty() {
-            let out: Vec<SymbolInformation> =
-                guard.values().flat_map(|idx| idx.workspace_symbols(&params.query)).collect();
-            return Ok(Some(out));
-        }
+        let mut out: Vec<SymbolInformation> =
+            guard.values().flat_map(|idx| idx.workspace_symbols(query)).collect();
         drop(guard);
+
+        // Files the index already answers for (by URI), and the (uri, name) pairs
+        // already listed, so the parser only adds what's missing.
+        let covered: HashSet<Url> = out.iter().map(|s| s.location.uri.clone()).collect();
+        let mut seen: HashSet<(Url, String)> =
+            out.iter().map(|s| (s.location.uri.clone(), s.name.clone())).collect();
+
+        // Open buffers whose unsaved text the saved-snapshot index hasn't indexed.
+        let open: Vec<Url> = self.state.parsed.read().await.keys().cloned().collect();
+        let mut dirty: HashSet<Url> = HashSet::new();
+        for uri in open {
+            if self.is_dirty(&uri).await {
+                dirty.insert(uri);
+            }
+        }
+
         let parsed = self.state.parsed.read().await;
-        Ok(Some(parse::workspace_symbols(&parsed, &params.query)))
+        for s in parse::workspace_symbols(&parsed, query) {
+            let uri = &s.location.uri;
+            // Skip files the index covers unless they have unsaved edits.
+            if covered.contains(uri) && !dirty.contains(uri) {
+                continue;
+            }
+            if seen.insert((uri.clone(), s.name.clone())) {
+                out.push(s);
+            }
+        }
+        Ok(Some(out))
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
