@@ -426,14 +426,24 @@ impl Backend {
         if path.extension().and_then(|e| e.to_str()) != Some("sol") {
             return;
         }
-        let Some(buffer) = self.state.docs.read().await.get(&uri).cloned() else {
-            return;
+        // All open buffers, keyed by path, so the check can type the edited file
+        // against the *unsaved* text of any file it imports (not stale disk).
+        let (buffer, open) = {
+            let docs = self.state.docs.read().await;
+            let Some(buffer) = docs.get(&uri).cloned() else {
+                return;
+            };
+            let open: HashMap<PathBuf, String> = docs
+                .iter()
+                .filter_map(|(u, t)| u.to_file_path().ok().map(|p| (p, t.clone())))
+                .collect();
+            (buffer, open)
         };
 
         let root = project::locate_root(&path);
         let (r, t, buf) = (root.clone(), path.clone(), buffer.clone());
         let errors = tokio::task::spawn_blocking(move || match r {
-            Some(r) => project::check_buffer(&r, &t, &buf),
+            Some(r) => project::check_buffer(&r, &t, &buf, &open),
             None => project::check_standalone(&t, &buf),
         })
         .await;

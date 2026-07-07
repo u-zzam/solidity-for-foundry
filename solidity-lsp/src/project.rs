@@ -557,7 +557,12 @@ pub fn compile(root: &Path, full: bool) -> Result<CompileOutput, String> {
 /// for live (as-you-type) diagnostics. Builds solc's standard-json input from
 /// the on-disk import graph, swaps in the buffer, and type-checks with no
 /// codegen (so via-ir projects stay fast). Requires a pinned solc version.
-pub fn check_buffer(root: &Path, target: &Path, buffer: &str) -> Result<Vec<SolcError>, String> {
+pub fn check_buffer(
+    root: &Path,
+    target: &Path,
+    buffer: &str,
+    open: &HashMap<PathBuf, String>,
+) -> Result<Vec<SolcError>, String> {
     let cfg = parse_config(root);
     // A project that pins no solc (e.g. version comes from each file's pragma)
     // otherwise got no live diagnostics at all; fall back to the buffer's pragma.
@@ -566,7 +571,11 @@ pub fn check_buffer(root: &Path, target: &Path, buffer: &str) -> Result<Vec<Solc
         .clone()
         .or_else(|| detect_solc(buffer))
         .ok_or("no solc version pinned or in the buffer's pragma")?;
-    let solc = Solc::find_or_install(&version).map_err(|e| e.to_string())?;
+    let mut solc = Solc::find_or_install(&version).map_err(|e| e.to_string())?;
+    // Resolve imports against the project root explicitly, so a just-typed
+    // `import "./New.sol"` whose file exists on disk still resolves even when the
+    // server's working directory isn't the root.
+    solc.base_path = Some(root.to_path_buf());
 
     let project = ProjectBuilder::<SolcCompiler>::default()
         .paths(build_paths(root, &cfg)?)
@@ -578,17 +587,27 @@ pub fn check_buffer(root: &Path, target: &Path, buffer: &str) -> Result<Vec<Solc
     // Type-check only: an empty output selection skips codegen.
     input.settings.output_selection = Default::default();
 
-    // Swap the edited file's on-disk content for the unsaved buffer.
-    let rel = target.strip_prefix(root).unwrap_or(target);
+    // Swap every open buffer's on-disk content for its unsaved text — the target
+    // from `buffer`, any other open file from `open`. Checking against stale disk
+    // for an imported-but-unsaved file produced phantom errors ("member not
+    // found", …) until that file was saved.
+    let norm_target = normalize_path(target);
+    let open_norm: HashMap<PathBuf, &str> =
+        open.iter().map(|(p, t)| (normalize_path(p), t.as_str())).collect();
     let mut found = false;
     for (p, source) in input.sources.iter_mut() {
-        if p == rel || p == target {
+        let abs = normalize_path(&if p.is_absolute() { p.clone() } else { root.join(p) });
+        if abs == norm_target {
             *source = Source::new(buffer);
             found = true;
+        } else if let Some(text) = open_norm.get(&abs) {
+            *source = Source::new(*text);
         }
     }
     if !found {
-        return Err("target is not in the project source graph".to_string());
+        // The target isn't in the project's source graph (outside src/test/
+        // script/libs). Nothing to live-check; the on-disk compile owns it.
+        return Ok(Vec::new());
     }
 
     let input = input.normalize_evm_version(&version);
