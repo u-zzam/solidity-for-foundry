@@ -228,13 +228,9 @@ function newClient(command: string): LanguageClient {
   const serverOptions: ServerOptions = { run, debug: run };
   const clientOptions: LanguageClientOptions = {
     documentSelector: [{ scheme: "file", language: "solidity" }],
-    synchronize: {
-      // .sol sources plus the project config: editing remappings or the solc
-      // pin should re-resolve imports and re-check open files.
-      fileEvents: workspace.createFileSystemWatcher(
-        "**/{*.sol,foundry.toml,remappings.txt}",
-      ),
-    },
+    // No client-side file watcher: the server registers one dynamically in
+    // `initialized` (workspace/didChangeWatchedFiles), which VS Code honors and
+    // which also reaches editors that ship no convenience watcher of their own.
     initializationOptions: {
       experimental: {
         inlayHints: workspace

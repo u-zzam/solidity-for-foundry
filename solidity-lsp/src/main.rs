@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, RwLock};
@@ -77,6 +77,12 @@ struct State {
     /// Roots we've already shown a live-check (solc install/compile) failure for,
     /// so a first-run failure is surfaced once instead of on every keystroke.
     warned_solc: Mutex<HashSet<PathBuf>>,
+    /// Whether the client supports dynamic registration of file watchers. VS
+    /// Code's client library also delivers watched-file events via its own
+    /// `synchronize.fileEvents` convenience, but Zed only sends them for
+    /// watchers the server registers over the protocol — so `initialized`
+    /// registers one, gated on this capability read from `initialize`.
+    watch_dynamic_registration: AtomicBool,
 }
 
 /// Clears a root from the in-flight indexing set when dropped, so a panic during
@@ -497,6 +503,31 @@ impl Backend {
             .await;
     }
 
+    /// Dynamically register a watcher for the project files whose changes affect
+    /// compilation — `.sol` sources plus `foundry.toml` / `remappings.txt` — so
+    /// `did_change_watched_files` fires in every client, not only ones that ship
+    /// their own convenience watcher.
+    async fn register_file_watchers(&self) {
+        let options = DidChangeWatchedFilesRegistrationOptions {
+            watchers: vec![FileSystemWatcher {
+                glob_pattern: GlobPattern::String(
+                    "**/{*.sol,foundry.toml,remappings.txt}".to_string(),
+                ),
+                kind: None,
+            }],
+        };
+        let registration = Registration {
+            id: "solidity-watched-files".to_string(),
+            method: "workspace/didChangeWatchedFiles".to_string(),
+            register_options: serde_json::to_value(options).ok(),
+        };
+        if let Err(e) = self.client.register_capability(vec![registration]).await {
+            self.client
+                .log_message(MessageType::WARNING, format!("could not register file watcher: {e}"))
+                .await;
+        }
+    }
+
     /// Run work off the message loop so the server stays responsive. Debounced
     /// and coalesced per root: a burst of opens/saves in one project collapses
     /// into a single whole-project compile after editing settles, rather than
@@ -697,6 +728,16 @@ impl LanguageServer for Backend {
             .and_then(|e| e.get("inlayHints"))
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
+        // Whether the client accepts a dynamically-registered file watcher, so
+        // `initialized` only registers one when it will actually be honored.
+        let watch = params
+            .capabilities
+            .workspace
+            .as_ref()
+            .and_then(|w| w.did_change_watched_files.as_ref())
+            .and_then(|d| d.dynamic_registration)
+            .unwrap_or(false);
+        self.state.watch_dynamic_registration.store(watch, Ordering::Relaxed);
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
                 name: "solidity-for-foundry-lsp".into(),
@@ -749,6 +790,12 @@ impl LanguageServer for Backend {
         self.client
             .log_message(MessageType::INFO, "solidity-for-foundry-lsp ready")
             .await;
+        // Register the file watcher over the protocol so editors that don't ship
+        // a client-side watcher (Zed) still deliver foundry.toml / remappings.txt
+        // / .sol changes; without it the watched-files handler never fires there.
+        if self.state.watch_dynamic_registration.load(Ordering::Relaxed) {
+            self.register_file_watchers().await;
+        }
         // forge drives fmt/lint and (via svm) solc installs; without it those
         // features silently do nothing. Warn once at startup if it's absent.
         let has_forge = tokio::task::spawn_blocking(|| {
