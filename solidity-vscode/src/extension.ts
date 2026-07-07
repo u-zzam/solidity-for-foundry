@@ -14,6 +14,8 @@ import {
 import * as fs from "fs";
 import * as https from "https";
 import * as path from "path";
+import * as stream from "stream";
+import * as crypto from "crypto";
 
 let client: LanguageClient | undefined;
 
@@ -36,10 +38,14 @@ function download(url: string, dest: string): Promise<void> {
   return new Promise((resolve, reject) => {
     // Stream into a sibling .part file and rename only once it is fully written,
     // so a process kill mid-download can never leave a truncated binary at `dest`
-    // that the next launch trusts via existsSync.
-    const part = `${dest}.part`;
+    // that the next launch trusts via existsSync. The pid keeps two windows'
+    // first-run downloads from clobbering each other's temp file.
+    const part = `${dest}.part-${process.pid}`;
     const file = fs.createWriteStream(part);
+    let settled = false;
     const fail = (e: Error) => {
+      if (settled) return;
+      settled = true;
       file.destroy();
       fs.rm(part, () => reject(e));
     };
@@ -64,21 +70,34 @@ function download(url: string, dest: string): Promise<void> {
             fail(new Error(`HTTP ${status}`));
             return;
           }
-          res.pipe(file);
-          file.on("finish", () =>
-            file.close((err) => {
-              if (err) {
-                fail(err);
-                return;
+          // A proxy/CDN that FINs mid-body closes the socket cleanly — no
+          // `error`, no `timeout` (destroy clears the inactivity timer) — which
+          // would hang the "Downloading…" promise forever. Surface it both via
+          // res.complete and pipeline's ERR_STREAM_PREMATURE_CLOSE.
+          res.on("close", () => {
+            if (!res.complete) {
+              fail(new Error("connection closed before download completed"));
+            }
+          });
+          stream.pipeline(res, file, (err) => {
+            if (err) {
+              fail(err);
+              return;
+            }
+            try {
+              // chmod the .part before the atomic rename so `dest` is never
+              // observed non-executable (a kill between rename and chmod used to
+              // leave a permanently unspawnable cached binary).
+              if (process.platform !== "win32") {
+                fs.chmodSync(part, 0o755);
               }
-              try {
-                fs.renameSync(part, dest);
-                resolve();
-              } catch (e) {
-                fail(e as Error);
-              }
-            }),
-          );
+              fs.renameSync(part, dest);
+              settled = true;
+              resolve();
+            } catch (e) {
+              fail(e as Error);
+            }
+          });
         },
       );
       req.on("error", fail);
@@ -89,6 +108,70 @@ function download(url: string, dest: string): Promise<void> {
     };
     get(url, 0);
   });
+}
+
+/// GET `url` as text, following redirects. Resolves `undefined` on 404 (a
+/// missing sibling asset), rejects on any other non-200.
+function fetchText(url: string): Promise<string | undefined> {
+  return new Promise((resolve, reject) => {
+    const get = (u: string, redirects: number) => {
+      if (redirects > 5) {
+        reject(new Error("too many redirects"));
+        return;
+      }
+      const req = https.get(
+        u,
+        { headers: { "User-Agent": "solidity-vscode" } },
+        (res) => {
+          const status = res.statusCode ?? 0;
+          if (status >= 300 && status < 400 && res.headers.location) {
+            res.resume();
+            get(res.headers.location, redirects + 1);
+            return;
+          }
+          if (status === 404) {
+            res.resume();
+            resolve(undefined);
+            return;
+          }
+          if (status !== 200) {
+            res.resume();
+            reject(new Error(`HTTP ${status}`));
+            return;
+          }
+          let body = "";
+          res.setEncoding("utf8");
+          res.on("data", (c) => (body += c));
+          res.on("close", () => {
+            if (!res.complete) reject(new Error("connection closed"));
+          });
+          res.on("end", () => resolve(body));
+        },
+      );
+      req.on("error", reject);
+      req.setTimeout(30_000, () => req.destroy(new Error("checksum timed out")));
+    };
+    get(url, 0);
+  });
+}
+
+/// Verify the downloaded binary against its sibling `<asset>.sha256`. Deletes
+/// `dest` and throws on mismatch; skips silently when the checksum asset 404s
+/// (older releases published no checksums).
+async function verifyChecksum(dest: string, assetUrl: string): Promise<void> {
+  const sums = await fetchText(`${assetUrl}.sha256`);
+  if (sums === undefined) {
+    return;
+  }
+  const expected = sums.trim().split(/\s+/)[0]?.toLowerCase();
+  const actual = crypto
+    .createHash("sha256")
+    .update(fs.readFileSync(dest))
+    .digest("hex");
+  if (expected !== actual) {
+    fs.rmSync(dest, { force: true });
+    throw new Error("server binary failed checksum verification");
+  }
 }
 
 /// Resolve the server binary: download the release matching this extension's
@@ -118,12 +201,20 @@ async function ensureServer(
       { location: ProgressLocation.Notification, title: `Downloading solidity-for-foundry-lsp ${version}…` },
       () => download(url, dest),
     );
-    if (process.platform !== "win32") {
-      fs.chmodSync(dest, 0o755);
+    await verifyChecksum(dest, url);
+    // Reclaim disk from prior-version binaries (16–21MB each, never reused).
+    const current = path.basename(dest);
+    for (const name of fs.readdirSync(dir)) {
+      if (
+        name.startsWith("solidity-for-foundry-lsp-") &&
+        !name.includes(".part") &&
+        name !== current
+      ) {
+        fs.rmSync(path.join(dir, name), { force: true });
+      }
     }
     return dest;
   } catch (e) {
-    fs.rmSync(dest, { force: true });
     window.showErrorMessage(
       `solidity: could not download the server (${e}). Set "solidity.serverPath" ` +
         "to a locally built solidity-for-foundry-lsp, or run `cargo install --path solidity-lsp`.",
@@ -170,21 +261,43 @@ async function startClient(context: ExtensionContext): Promise<void> {
     .getConfiguration("solidity")
     .get<string>("serverPath")
     ?.trim();
-  const command =
-    configured && configured.length > 0
-      ? configured
-      : await ensureServer(context);
-  if (!command) {
+  if (configured && configured.length > 0) {
+    client = newClient(configured);
+    await client.start();
     return;
   }
-  client = newClient(command);
-  await client.start();
+  // Downloaded binary: a cache that spawn-fails (killed mid-write, a 200 HTML
+  // error page slipped past, a partial chmod) fails every launch. Delete it and
+  // re-download once before giving up.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const command = await ensureServer(context);
+    if (!command) {
+      return;
+    }
+    client = newClient(command);
+    try {
+      await client.start();
+      return;
+    } catch (e) {
+      await client.stop().catch(() => {});
+      if (attempt === 0) {
+        fs.rmSync(command, { force: true });
+        continue;
+      }
+      window.showErrorMessage(
+        `solidity: the server binary failed to start (${e}). ` +
+          'Set "solidity.serverPath" to a locally built solidity-for-foundry-lsp.',
+      );
+    }
+  }
 }
 
 export async function activate(context: ExtensionContext): Promise<void> {
   context.subscriptions.push(
     commands.registerCommand("solidity.restartServer", async () => {
-      await client?.stop();
+      // stop() throws when the client is in StartFailed state — the exact case
+      // this restart is meant to recover from — so swallow it.
+      await client?.stop().catch(() => {});
       await startClient(context);
     }),
     workspace.onDidChangeConfiguration(async (e) => {
@@ -207,5 +320,5 @@ export async function activate(context: ExtensionContext): Promise<void> {
 }
 
 export function deactivate(): Thenable<void> | undefined {
-  return client?.stop();
+  return client?.stop().catch(() => {});
 }
