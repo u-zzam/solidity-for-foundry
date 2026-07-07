@@ -928,21 +928,26 @@ impl LanguageServer for Backend {
 
     async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
         let p = params.text_document_position_params;
-        let Some(text) = self.state.docs.read().await.get(&p.text_document.uri).cloned() else {
-            return Ok(None);
-        };
-        let Some(root) = p.text_document.uri.to_file_path().ok().and_then(|path| project::locate_root(&path)) else {
+        let uri = p.text_document.uri;
+        let Some(text) = self.state.docs.read().await.get(&uri).cloned() else {
             return Ok(None);
         };
         let offset = diagnostics::PositionMapper::new(&text).offset(p.position);
         let Some((callee, active)) = call_context(&text, offset) else {
             return Ok(None);
         };
-        let guard = self.state.index.read().await;
-        let Some(idx) = guard.get(&root) else {
-            return Ok(None);
-        };
-        Ok(idx.signatures(&callee, active))
+        // Accurate index, resolved by callee name — position-independent, so no
+        // buffer-match gate; signature help should keep working mid-edit.
+        if let Some(root) = uri.to_file_path().ok().and_then(|path| project::locate_root(&path)) {
+            let guard = self.state.index.read().await;
+            if let Some(help) = guard.get(&root).and_then(|idx| idx.signatures(&callee, active)) {
+                return Ok(Some(help));
+            }
+        }
+        // Live parser fallback: cold start, a broken build, or no foundry.toml,
+        // where the index has nothing to answer with.
+        let parsed = self.state.parsed.read().await;
+        Ok(parse::signatures(&parsed, &callee, active))
     }
 
     async fn code_action(

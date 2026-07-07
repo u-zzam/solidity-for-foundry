@@ -14,7 +14,8 @@ use std::collections::{HashMap, HashSet};
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, DocumentHighlight, DocumentHighlightKind, DocumentSymbol,
     Hover, HoverContents, InlayHint, InlayHintKind, InlayHintLabel, Location, MarkupContent,
-    MarkupKind, Position, Range, SymbolInformation, SymbolKind, Url,
+    MarkupKind, ParameterInformation, ParameterLabel, Position, Range, SignatureHelp,
+    SignatureInformation, SymbolInformation, SymbolKind, Url,
 };
 use tree_sitter::{Node, Parser};
 
@@ -883,6 +884,82 @@ pub fn call_hints(files: &HashMap<Url, File>, uri: &Url, range: Range) -> Vec<In
     out
 }
 
+/// Signature help for a callable named `callee`, from the live parse (every
+/// overload across the open buffers). The accurate index is preferred; this
+/// answers on cold start, through a broken build, and for a config-less file,
+/// where the index can't. Resolution is by name only.
+pub fn signatures(files: &HashMap<Url, File>, callee: &str, active: u32) -> Option<SignatureHelp> {
+    let signatures: Vec<SignatureInformation> = files
+        .values()
+        .flat_map(|f| f.defs.iter())
+        .filter(|d| d.kind.takes_args() && d.name == callee && !d.detail.is_empty())
+        .map(|d| SignatureInformation {
+            label: d.detail.clone(),
+            documentation: None,
+            parameters: Some(
+                param_labels(&d.detail, &d.params)
+                    .into_iter()
+                    .map(|p| ParameterInformation {
+                        label: ParameterLabel::Simple(p),
+                        documentation: None,
+                    })
+                    .collect(),
+            ),
+            active_parameter: Some(active),
+        })
+        .collect();
+    (!signatures.is_empty()).then_some(SignatureHelp {
+        signatures,
+        active_signature: Some(0),
+        active_parameter: Some(active),
+    })
+}
+
+/// Parameter labels for signature help, taken from the first parenthesized group
+/// of a rendered header (`function f(uint a, uint b) public` -> `["uint a",
+/// "uint b"]`) so the active parameter highlights precisely. Falls back to the
+/// bare parameter names when the header has no `(...)` list (e.g. a struct, whose
+/// header is its `{ ... }` body).
+fn param_labels(detail: &str, names: &[String]) -> Vec<String> {
+    let Some(open) = detail.find('(') else {
+        return names.to_vec();
+    };
+    let mut depth = 0usize;
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for ch in detail[open..].chars() {
+        match ch {
+            '(' => {
+                depth += 1;
+                if depth > 1 {
+                    cur.push('(');
+                }
+            }
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+                cur.push(')');
+            }
+            ',' if depth == 1 => {
+                parts.push(cur.trim().to_string());
+                cur.clear();
+            }
+            c => cur.push(c),
+        }
+    }
+    let last = cur.trim().to_string();
+    if !last.is_empty() {
+        parts.push(last);
+    }
+    if parts.is_empty() {
+        names.to_vec()
+    } else {
+        parts
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -997,6 +1074,29 @@ contract C {
         assert!(counter.iter().any(|i| i.label == "bump"));
         // Locals/params never leak into member completion.
         assert!(!counter.iter().any(|i| i.label == "by"));
+    }
+
+    #[test]
+    fn signatures_from_live_parse() {
+        let (files, _) = store();
+        // `MathLib.add(uint a, uint b)` — one overload, active on the 2nd param.
+        let sh = signatures(&files, "add", 1).unwrap();
+        assert_eq!(sh.signatures.len(), 1);
+        assert!(
+            sh.signatures[0].label.contains("function add(uint a, uint b)"),
+            "{}",
+            sh.signatures[0].label
+        );
+        assert_eq!(sh.active_parameter, Some(1));
+        let params = sh.signatures[0].parameters.as_ref().unwrap();
+        assert_eq!(params.len(), 2);
+        // Labels reconstructed from the header (type + name), for precise bolding.
+        match &params[0].label {
+            ParameterLabel::Simple(s) => assert_eq!(s, "uint a"),
+            _ => panic!("expected a simple label"),
+        }
+        // An unknown callee yields nothing (so the handler returns None).
+        assert!(signatures(&files, "nope", 0).is_none());
     }
 
     #[test]
