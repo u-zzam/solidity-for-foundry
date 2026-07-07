@@ -49,13 +49,30 @@ pub struct CompileOutput {
 const DEFAULT_IGNORED_CODES: [u64; 4] = [1878, 5574, 3860, 2394];
 
 /// foundry.toml `ignored_error_codes` accepts either a numeric code or a named
-/// alias; map the aliases forge defines, fall back to parsing an integer.
+/// alias; map every alias forge's `SolidityErrorCode` defines, fall back to
+/// parsing an integer. A missing alias would silently keep a warning forge
+/// suppresses, so this mirrors forge's set exactly.
 fn error_code(s: &str) -> Option<u64> {
     match s {
         "license" => Some(1878),
+        "constructor-visibility" => Some(2462),
         "code-size" => Some(5574),
         "init-code-size" => Some(3860),
+        "func-mutability" => Some(2018),
+        "unused-var" => Some(2072),
+        "unused-param" => Some(5667),
+        "unused-return" => Some(9302),
+        "virtual-interfaces" => Some(5815),
+        "missing-receive-ether" => Some(3628),
+        "shadowing" => Some(2519),
+        "same-varname" => Some(8760),
+        "unnamed-return" => Some(6321),
+        "unreachable" => Some(5740),
+        "pragma-solidity" => Some(3420),
         "transient-storage" => Some(2394),
+        "too-many-warnings" => Some(4591),
+        "transfer-deprecated" => Some(9207),
+        "natspec-memory-safe-assembly-deprecated" => Some(2424),
         _ => s.parse().ok(),
     }
 }
@@ -637,6 +654,20 @@ mod tests {
         // No pragma, or no concrete x.y.z, yields nothing.
         assert_eq!(detect_solc("contract C {}"), None);
         assert_eq!(detect_solc("pragma solidity ^0.8;"), None);
+    }
+
+    #[test]
+    fn ignored_error_code_aliases_resolve() {
+        let root = temp_dir();
+        std::fs::write(
+            root.join("foundry.toml"),
+            "[profile.default]\nignored_error_codes = [\"unused-param\", \"func-mutability\", 1234]\n",
+        )
+        .unwrap();
+        let cfg = config_for(&root, "default");
+        // Named aliases map to their solc codes; a bare integer passes through.
+        assert_eq!(cfg.ignored_error_codes, vec![5667, 2018, 1234]);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
