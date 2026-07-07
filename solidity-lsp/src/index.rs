@@ -840,12 +840,25 @@ fn node_symbol(node: &Value, mapper: &PositionMapper) -> Option<DocumentSymbol> 
     let map = node.as_object()?;
     let kind = gets(map, "nodeType")?;
     let name = gets(map, "name")?;
-    if name.is_empty() {
-        return None;
-    }
-    let (ns, nl) = gets(map, "nameLocation").and_then(parse_src)?;
     let (fs, fl) = gets(map, "src").and_then(parse_src)?;
-    let selection = Range::new(mapper.position(ns), mapper.position(ns + nl));
+    // Constructor / receive / fallback carry an empty name and no nameLocation, so
+    // solc gives them nothing to anchor an outline entry on. Synthesize a name and
+    // a selection range at the leading keyword (the node's src start), mirroring
+    // the live parser, so they stay in breadcrumbs once the index takes over
+    // instead of blinking away.
+    let (display, selection) = if name.is_empty() {
+        let keyword = match gets(map, "kind") {
+            Some("constructor") => "constructor",
+            Some("fallback") => "fallback",
+            Some("receive") => "receive",
+            _ => return None,
+        };
+        let sel = Range::new(mapper.position(fs), mapper.position(fs + keyword.len()));
+        (keyword.to_string(), sel)
+    } else {
+        let (ns, nl) = gets(map, "nameLocation").and_then(parse_src)?;
+        (name.to_string(), Range::new(mapper.position(ns), mapper.position(ns + nl)))
+    };
     let mut range = Range::new(mapper.position(fs), mapper.position(fs + fl));
     // selection_range must be contained in range.
     if selection.start < range.start {
@@ -861,7 +874,7 @@ fn node_symbol(node: &Value, mapper: &PositionMapper) -> Option<DocumentSymbol> 
 
     #[allow(deprecated)]
     Some(DocumentSymbol {
-        name: name.to_string(),
+        name: display,
         detail: type_string(map),
         kind: symbol_kind(kind),
         tags: None,
@@ -1669,6 +1682,46 @@ mod tests {
             .collect();
         assert!(labels.contains(&"amount:".to_string()), "{labels:?}");
         assert!(labels.contains(&"to:".to_string()), "{labels:?}");
+    }
+
+    #[test]
+    fn outline_includes_constructor_receive_fallback() {
+        // solc gives these empty names and no nameLocation; the outline must still
+        // list them (with a keyword-anchored selection range) so they don't vanish
+        // from breadcrumbs when the index supersedes the live parser.
+        let text = "contract Tok {\n    constructor() {}\n    receive() external payable {}\n    fallback() external {}\n}";
+        let ctor = text.find("constructor").unwrap();
+        let recv = text.find("receive").unwrap();
+        let fbk = text.find("fallback").unwrap();
+        let ast = json!({
+            "id": 1, "nodeType": "SourceUnit", "src": format!("0:{}:0", text.len()),
+            "nodes": [
+                { "id": 10, "nodeType": "ContractDefinition", "name": "Tok",
+                  "nameLocation": "9:3:0", "src": format!("0:{}:0", text.len()), "nodes": [
+                    { "id": 11, "nodeType": "FunctionDefinition", "name": "", "kind": "constructor",
+                      "src": format!("{ctor}:16:0"), "parameters": { "parameters": [] } },
+                    { "id": 12, "nodeType": "FunctionDefinition", "name": "", "kind": "receive",
+                      "src": format!("{recv}:29:0"), "parameters": { "parameters": [] } },
+                    { "id": 13, "nodeType": "FunctionDefinition", "name": "", "kind": "fallback",
+                      "src": format!("{fbk}:20:0"), "parameters": { "parameters": [] } }
+                  ] }
+            ]
+        });
+        let path = "/no-such-dir-solidity-lsp/A.sol";
+        let idx = Index::build(&[src(1, path, text, ast)]);
+        let syms = idx.document_symbols(Path::new(path));
+        let tok = syms.iter().find(|s| s.name == "Tok").unwrap();
+        let members: Vec<&str> =
+            tok.children.as_ref().unwrap().iter().map(|c| c.name.as_str()).collect();
+        for m in ["constructor", "receive", "fallback"] {
+            assert!(members.contains(&m), "outline missing {m}: {members:?}");
+        }
+        // The selection range for the constructor anchors on its keyword.
+        let ctor_sym =
+            tok.children.as_ref().unwrap().iter().find(|c| c.name == "constructor").unwrap();
+        let m = PositionMapper::new(text);
+        assert_eq!(ctor_sym.selection_range.start, m.position(ctor));
+        assert_eq!(ctor_sym.selection_range.end, m.position(ctor + "constructor".len()));
     }
 
     #[test]
