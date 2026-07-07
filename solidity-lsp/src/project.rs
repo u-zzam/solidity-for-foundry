@@ -255,35 +255,41 @@ impl Default for Config {
 }
 
 /// Match a root-relative `path` against a foundry `skip` glob. `*`/`**` match any
-/// run of characters (crossing `/`, as forge's default globset does) and `?`
-/// matches one; other glob syntax (`[...]`, `{a,b}`) is treated literally — the
-/// `skip` patterns projects use to exclude non-compiling files are simple.
+/// run of characters (crossing `/`, as forge's default globset with
+/// `literal_separator = false`) and `?` matches one; a `**/` at a component
+/// boundary additionally matches zero or more whole path components, so
+/// `**/foo.sol` also skips a top-level `foo.sol`. Other glob syntax (`[...]`,
+/// `{a,b}`) is treated literally — the `skip` patterns projects use to exclude
+/// non-compiling files are simple.
 fn glob_match(pat: &str, path: &str) -> bool {
-    let (p, t) = (pat.as_bytes(), path.as_bytes());
-    let (mut pi, mut ti) = (0, 0);
-    let (mut star, mut mark) = (None, 0);
-    while ti < t.len() {
-        if pi < p.len() && (p[pi] == b'?' || p[pi] == t[ti]) {
-            pi += 1;
-            ti += 1;
-        } else if pi < p.len() && p[pi] == b'*' {
-            while pi < p.len() && p[pi] == b'*' {
-                pi += 1;
-            }
-            star = Some(pi);
-            mark = ti;
-        } else if let Some(s) = star {
-            pi = s;
-            mark += 1;
-            ti = mark;
-        } else {
-            return false;
+    glob_match_bytes(pat.as_bytes(), path.as_bytes())
+}
+
+// ponytail: naive backtracking matcher, O(n^stars) worst case — skip globs are
+// short and few, so it is never hot; reach for the `globset` crate if that ever
+// changes.
+fn glob_match_bytes(p: &[u8], t: &[u8]) -> bool {
+    if p.is_empty() {
+        return t.is_empty();
+    }
+    // `**/` matches zero or more whole path components: match the rest at this
+    // component boundary, or peel off one leading `/`-terminated component and
+    // retry. Anchoring to a `/` keeps `test` a whole component, not a suffix.
+    if let Some(rest) = p.strip_prefix(b"**/") {
+        return glob_match_bytes(rest, t)
+            || (0..t.len()).any(|i| t[i] == b'/' && glob_match_bytes(rest, &t[i + 1..]));
+    }
+    match p[0] {
+        b'*' => {
+            let stars = p.iter().take_while(|&&c| c == b'*').count();
+            let rest = &p[stars..];
+            // `*`/`**` (not at a `**/` boundary) match any run of characters,
+            // separators included.
+            (0..=t.len()).any(|i| glob_match_bytes(rest, &t[i..]))
         }
+        b'?' => !t.is_empty() && glob_match_bytes(&p[1..], &t[1..]),
+        c => !t.is_empty() && t[0] == c && glob_match_bytes(&p[1..], &t[1..]),
     }
-    while pi < p.len() && p[pi] == b'*' {
-        pi += 1;
-    }
-    pi == p.len()
 }
 
 /// If `root/foundry.toml` exists but isn't valid TOML, the parse error.
@@ -1004,6 +1010,17 @@ mod tests {
         assert!(!glob_match("src/legacy/*.sol", "src/current/New.sol"));
         assert!(glob_match("src/?.sol", "src/A.sol"));
         assert!(!glob_match("src/?.sol", "src/AB.sol"));
+
+        // A leading `**/` matches zero or more path components, so a top-level
+        // file is skipped just like a nested one (globset semantics).
+        assert!(glob_match("**/test/**", "test/Counter.t.sol"));
+        assert!(glob_match("**/test/**", "pkg/test/Counter.t.sol"));
+        assert!(glob_match("**/*.t.sol", "Counter.t.sol"));
+        // Interior `/**/` also collapses to zero components.
+        assert!(glob_match("a/**/b", "a/b"));
+        // But a `**/` literal segment still matches a whole component, not a
+        // suffix — `**/test/**` must not match `xtest/…`.
+        assert!(!glob_match("**/test/**", "xtest/Counter.t.sol"));
 
         let root = temp_dir();
         std::fs::write(
