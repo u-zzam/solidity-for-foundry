@@ -46,6 +46,11 @@ struct State {
     /// saves bumps it repeatedly and only the last one survives the delay, so
     /// the heavy full compile is coalesced and kept off the save's hot path.
     index_gen: Mutex<HashMap<PathBuf, u64>>,
+    /// Per-root generation counter that debounces diagnostics compiles the same
+    /// way `index_gen` debounces index rebuilds. Restoring a session opens N tabs
+    /// of one project at once; without this each queued a whole-project compile
+    /// plus a full `forge lint` subprocess (which, unlike solc, has no cache).
+    diag_gen: Mutex<HashMap<PathBuf, u64>>,
     /// Latest document version per URI, to debounce live as-you-type checks.
     live_versions: Mutex<HashMap<Url, i32>>,
     /// forge lint quick-fixes from the last compile, per URI, for code actions.
@@ -344,10 +349,35 @@ impl Backend {
             .await;
     }
 
-    /// Run work off the message loop so the server stays responsive.
+    /// Run work off the message loop so the server stays responsive. Debounced
+    /// and coalesced per root: a burst of opens/saves in one project collapses
+    /// into a single whole-project compile after editing settles, rather than
+    /// queuing one compile (and one uncached `forge lint`) per file behind the
+    /// compile mutex. The last event's URI wins — it only seeds the root and the
+    /// fallback for location-less errors, and every file in the burst shares the
+    /// same root and the same whole-project compile.
     fn schedule_diagnostics(&self, uri: Url) {
         let me = self.clone();
-        tokio::spawn(async move { me.run_diagnostics(uri).await });
+        tokio::spawn(async move {
+            let Some(root) = uri.to_file_path().ok().and_then(|p| project::locate_root(&p)) else {
+                // No Foundry root: nothing to coalesce (run_diagnostics only warns
+                // for a standalone file). Preserve that by running it directly.
+                me.run_diagnostics(uri).await;
+                return;
+            };
+            let gen = {
+                let mut g = me.state.diag_gen.lock().await;
+                let next = g.get(&root).copied().unwrap_or(0) + 1;
+                g.insert(root.clone(), next);
+                next
+            };
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            // A newer open/save superseded this one; let that one compile.
+            if me.state.diag_gen.lock().await.get(&root).copied() != Some(gen) {
+                return;
+            }
+            me.run_diagnostics(uri).await;
+        });
     }
 
     /// Refresh the accuracy index off the hot path: debounced per root so a run
