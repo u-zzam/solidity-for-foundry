@@ -1045,8 +1045,23 @@ impl LanguageServer for Backend {
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        self.state.docs.write().await.remove(&params.text_document.uri);
-        self.state.parsed.write().await.remove(&params.text_document.uri);
+        let uri = params.text_document.uri;
+        // Was the buffer dirty? Its live squiggles point into text that closing
+        // discards, so they'd linger as ghosts at offsets no file has. Check
+        // before dropping the buffer, since is_dirty reads it.
+        let was_dirty = self.is_dirty(&uri).await;
+        self.state.docs.write().await.remove(&uri);
+        self.state.parsed.write().await.remove(&uri);
+        if was_dirty {
+            // Clear the stale diagnostics, then restore the on-disk truth: a
+            // Foundry file gets a fresh compile (which republishes any real
+            // on-disk errors); a standalone file has nothing to recompile.
+            self.state.published.lock().await.remove(&uri);
+            self.client.publish_diagnostics(uri.clone(), Vec::new(), None).await;
+            if uri.to_file_path().ok().and_then(|p| project::locate_root(&p)).is_some() {
+                self.schedule_diagnostics(uri);
+            }
+        }
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
